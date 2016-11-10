@@ -9,6 +9,7 @@ use crossbeam::sync::MarkableArcCell;
 
 /// A concurrent lock-free linked list with elements sorted by the key's hash and then by the key itself.
 #[derive(Debug)]
+// TODO explicit Send and Sync. right now it's implicitly (i think) as Send and Sync as K and V
 pub struct SortedLazyList<K, V, S> {
     head: Arc<Option<Node<K, V>>>,
     hasher_factory: S,
@@ -151,11 +152,11 @@ impl<K, V, S> SortedLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
                         false,
                         false
                     ) {
-			continue 'begin_from_head;
+                        continue 'begin_from_head;
                     }
 
                     if (*succ).is_none() {
-                        // we hit the end 
+                        // we reached the end of the list
                         return Err(NodeAccess {
                             pred: pred,
                             // next
@@ -191,11 +192,62 @@ impl<K, V, S> SortedLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
                 curr = succ;
             }
 
-	    return Err(NodeAccess {
-                pred: pred,
-                // next
-                curr_or_next: curr,
+            return Err(NodeAccess {
+                    pred: pred,
+                    // next
+                    curr_or_next: curr,
             } );
+        } // loop
+    } // fn
+
+    /// Forces physical removal of all logically removed nodes. Useful if the user wants to
+    /// retrieve the raw key and value from a node accessor, but the node is still owned by
+    /// the list.
+    pub fn cleanup(&self) { 
+        'begin_from_head: loop {
+            // predecessor. the initial value of `self.head` is an invalid node and so its hash or
+            // key are never checked
+            let mut pred = self.head.clone();
+            // currently looked at
+            let mut curr = (*pred).as_ref().unwrap().next.get_arc();
+
+            while curr.is_some() {
+                // c'mon rust, this should be (succ, curr_marked) = ...
+                let pr = (*curr).as_ref().unwrap().next.get();
+                // successor node
+                let mut succ = pr.0;
+                // marked nodes are logically deleted. this routine deletes them physically
+                let mut curr_marked = pr.1;
+
+                while curr_marked {
+                    // a CAS failure indicated that another thread messed with the predecessor node
+                    // in which case we restart from head
+                    if !(*pred).as_ref().unwrap().next.compare_exchange(
+                        curr.clone(),
+                        succ.clone(),
+                        false,
+                        false
+                    ) {
+                        continue 'begin_from_head;
+                    }
+
+                    if (*succ).is_none() {
+                        // we reached the end of the list
+                        return;
+                    }
+
+                    // move over the removed node. pred stays the same, curr and succ advance
+                    curr = succ;
+                    let pr = (*curr).as_ref().unwrap().next.get();
+                    succ = pr.0;
+                    curr_marked = pr.1;
+                }
+
+                pred = curr;
+                curr = succ;
+            }
+
+            return;
         } // loop
     } // fn
 
@@ -265,14 +317,13 @@ impl<K, V, S> SortedLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
             match self.find_pair(key) {
                 Ok(acc) => {
                     let succ = (*acc.curr_or_next).as_ref().unwrap().next.get_arc();
-                    if !(*acc.curr_or_next).as_ref().unwrap().next.compare_arc_exchange_mark(succ.clone(), true) {
+                    if !(*acc.curr_or_next).as_ref().unwrap().next.compare_exchange(succ.clone(), succ.clone(), false, true) {
                         continue;
                     }
 
-                    // wtf why is this done tiwce, i.e. here and in find_pair?
-                    // possible answer: to speed things up, we try to do remove the node, but if we fail, we leave this to find_pair
-                    let t = (*acc.pred).as_ref().unwrap().next.compare_exchange(acc.curr_or_next.clone(), succ, false, false);
-                    // this might fail, oh well
+                    // we immediately try to physically remove the node. if we fail, the node will
+                    // have to be removed later
+                    (*acc.pred).as_ref().unwrap().next.compare_exchange(acc.curr_or_next.clone(), succ, false, false);
 
                     return Some( SortedLazyListAccessor { acc: acc.curr_or_next, } );
                 },
@@ -296,7 +347,9 @@ impl<K, V, S> SortedLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
 
         let mut count = 0;
         while curr.is_some() {
-            count = count + 1;
+            if !(*curr).as_ref().unwrap().next.is_marked() {
+                count = count + 1;
+            }
             curr = (*curr).as_ref().unwrap().next.get_arc();
         }
 
@@ -316,6 +369,7 @@ mod tests {
     use crossbeam::scope;
 
     use super::*;
+
 
     #[test]
     fn basic_insert() {
@@ -339,6 +393,7 @@ mod tests {
         assert!(removed.is_some());
         let acc = removed.unwrap();
         assert!(*acc == 1);
+        list.cleanup();
         let val = acc.try_unwrap();
         assert!(val.is_ok());
         let val = val.unwrap();
@@ -364,19 +419,22 @@ mod tests {
         assert!(list.len() == 0);
     }
 
-    const NUM_THREADS: usize = 8;
+    const NUM_THREADS: usize = 32;
 
+    // newtype wrapper that defaults to move in closures
+    struct U32(u32);
     #[test]
     fn concurrent() {
         let build = BuildHasherDefault::<SipHasher>::default();
         let list = SortedLazyList::<u32, u32, _>::with_hash_factory(build);
 
+        // general test of concurrent operations
         let b = Barrier::new(NUM_THREADS);
-        let u = AtomicUsize::new(0);
         scope(|scope| {
             for i in 0..NUM_THREADS {
+                let i = U32(i as u32);
                 scope.spawn(|| {
-                    let k = 2*u.fetch_add(1, Ordering::Relaxed) as u32;
+                    let k = 2*{i}.0;
                     b.wait();
                     let inserted = list.insert(k, k+1);
                     assert!(inserted);
@@ -389,6 +447,7 @@ mod tests {
                     assert!(*acc == k+1);
                     let mut val = acc.try_unwrap();
                     while let Err(a) = val {
+                        list.cleanup();
                         val = a.try_unwrap();
                     }
                     let val = val.unwrap();
@@ -403,6 +462,23 @@ mod tests {
 
         assert!(list.len() == 0);
 
+        // only one thread can remove a single item
+        list.insert(20, 24);
         let u = AtomicUsize::new(0);
+        scope(|scope| {
+            for _ in 0..NUM_THREADS {
+                scope.spawn(|| {
+                    b.wait();
+                    let removed = list.remove(&20);
+                    if removed.is_some() {
+                        u.fetch_add(1, Ordering::Relaxed);
+                    }
+                } );
+            }
+        } );
+
+        assert!(u.load(Ordering::SeqCst) == 1);
     }
+
+    // TODO more tests!
 }

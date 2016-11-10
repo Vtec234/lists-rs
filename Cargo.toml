@@ -4,4 +4,4 @@ version = "0.0.1"
 authors = ["Wojciech Nawrocki <wjnawrocki+gh@protonmail.com>"]
 
 [dependencies]
-crossbeam = { path = "../crossbeam" }
+crossbeam = { git = "https://github.com/Vtec234/crossbeam", branch = "lazy-list-map" }
