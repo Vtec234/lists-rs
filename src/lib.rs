@@ -1,36 +1,49 @@
 extern crate crossbeam;
 
-use crossbeam::sync::MarkableArcCell;
 use std::sync::Arc;
 use std::hash::{Hash, Hasher, BuildHasher};
 use std::ops::Deref;
 
+use crossbeam::sync::MarkableArcCell;
 
-struct Node<K, V> {
-    hash: u64,
-    key: K,
-    val: V,
 
-    next: MarkableArcCell<Option<Node<K, V>>>,
-}
-
+/// A concurrent lock-free linked list with elements sorted by the key's hash and then by the key itself.
+#[derive(Debug)]
 pub struct SortedLazyList<K, V, S> {
     head: Arc<Option<Node<K, V>>>,
     hasher_factory: S,
 }
 
-struct NodeAccess<K, V> {
-    pred: Arc<Option<Node<K, V>>>,
-    curr: Arc<Option<Node<K, V>>>,
+/// A single node in the linked list, containg a key and a value.
+#[derive(Debug)]
+struct Node<K, V> {
+    hash: u64,
+    // TODO can we make this work for unsized types?
+    key: K,
+    val: V,
+
+    // A marker value of `true` indicates that this node has been logically deleted.
+    next: MarkableArcCell<Option<Node<K, V>>>,
 }
 
+/// A pair of (hopefully :]) consecutive nodes for internal access.
+#[derive(Debug)]
+struct NodeAccess<K, V> {
+    pred: Arc<Option<Node<K, V>>>,
+    curr_or_next: Arc<Option<Node<K, V>>>,
+}
+
+/// Provides access to nodes in the list.
+#[derive(Debug)]
 pub struct SortedLazyListAccessor<K, V> {
+    // This should never be None. It's only an Option so that the type is the same as in the list.
     acc: Arc<Option<Node<K, V>>>,
 }
 
 impl<K, V> SortedLazyListAccessor<K, V> {
-    /// This method only has a chance to work on a recently removed node, so when it is returned
-    /// from list.remove and not from list.find.
+    /// This method only has a chance to work on a recently removed node. That is, in the case when it
+    /// is returned from list.remove(). Even then, it might still be co-owned by another thread. It returns
+    /// the key and value if it succeeds, the same accessor otherwise.
     pub fn try_unwrap(self) -> Result<(K, V), Self> {
         match Arc::try_unwrap(self.acc) {
             Ok(opt) => {
@@ -56,7 +69,10 @@ impl<K, V, S> Drop for SortedLazyList<K, V, S> {
         use std::ptr;
 
         unsafe {
+            // First drop the actual node after `head`.
             ptr::drop_in_place(&mut Arc::get_mut(&mut self.head).unwrap().as_mut().unwrap().next as *mut MarkableArcCell<Option<Node<K, V>>>);
+
+            // Then drop the fake head node.
             // TODO is this enough to set it to None?
             let fake_head_opt = ptr::replace(
                 Arc::get_mut(&mut self.head).unwrap() as *mut Option<Node<K, V>>,
@@ -72,8 +88,8 @@ impl<K, V, S> SortedLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
         use std::mem;
         use std::ptr;
 
-        // an unsafe head Node with invalid key, val is necessary not to require an Option<(K, V)>
-        // in the Node
+        // we construct an unsafe fake head node so that the types of `pred` when performing operations
+        // can be uniform. surely there exists a nicer way to do hits, but i don't know it
         let mut fake_head: Node<K, V> = unsafe { mem::zeroed() };
         unsafe {
             ptr::write_bytes(
@@ -111,10 +127,7 @@ impl<K, V, S> SortedLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
     fn find_pair(&self, key: &K) -> Result<NodeAccess<K, V>, NodeAccess<K, V>> {
         let hash = self.hash(key);
 
-        loop {
-            // a goto would be much nicer :<
-            let mut breakout = false;
-
+        'begin_from_head: loop {
             // predecessor. the initial value of `self.head` is an invalid node and so its hash or
             // key are never checked
             let mut pred = self.head.clone();
@@ -138,8 +151,16 @@ impl<K, V, S> SortedLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
                         false,
                         false
                     ) {
-                        breakout = true;
-                        break;
+			continue 'begin_from_head;
+                    }
+
+                    if (*succ).is_none() {
+                        // we hit the end 
+                        return Err(NodeAccess {
+                            pred: pred,
+                            // next
+                            curr_or_next: succ,
+                        } );
                     }
 
                     // move over the removed node. pred stays the same, curr and succ advance
@@ -149,22 +170,20 @@ impl<K, V, S> SortedLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
                     curr_marked = pr.1;
                 }
 
-                if breakout {
-                    break;
-                }
-
                 let curr_hash = (*curr).as_ref().unwrap().hash;
                 if curr_hash == hash
                 && &(*curr).as_ref().unwrap().key == key {
                     return Ok(NodeAccess {
                         pred: pred,
-                        curr: curr,
+                        // curr
+                        curr_or_next: curr,
                     } );
                 }
                 else if curr_hash > hash {
                     return Err(NodeAccess {
                         pred: pred,
-                        curr: curr,
+                        // next
+                        curr_or_next: curr,
                     } );
                 }
 
@@ -172,18 +191,17 @@ impl<K, V, S> SortedLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
                 curr = succ;
             }
 
-            if !breakout {
-                return Err(NodeAccess {
-                    pred: pred,
-                    curr: curr,
-                } );
-            } // if !breakout
+	    return Err(NodeAccess {
+                pred: pred,
+                // next
+                curr_or_next: curr,
+            } );
         } // loop
     } // fn
 
     /// Inserts a key-value pair into the list. Fails if a node with the given key already exists.
     /// Returns whether the insert was successful.
-    /// This method is block-free with respect to other `remove`s and `insert`s but may wait until
+    /// This method is obstruction-free with respect to other `remove`s and `insert`s but may wait until
     /// all `find` and `contains` call are finished.
     pub fn insert(&self, key: K, val: V) -> bool {
         let new = Arc::new( Some( Node {
@@ -197,20 +215,22 @@ impl<K, V, S> SortedLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
         loop {
             match self.find_pair(&(*new).as_ref().unwrap().key) {
                 Ok(_) => {
+                    // a node with this key already exists
                     return false;
                 },
                 Err(acc) => {
-                    (*new).as_ref().unwrap().next.set(acc.curr.clone(), false);
-                    if (*acc.pred).as_ref().unwrap().next.compare_exchange(acc.curr, new.clone(), false, false) {
+                    (*new).as_ref().unwrap().next.set(acc.curr_or_next.clone(), false);
+                    if (*acc.pred).as_ref().unwrap().next.compare_exchange(acc.curr_or_next, new.clone(), false, false) {
                         return true;
                     }
+                    // if CAS failed, redo search
                 },
             }
         }
     }
 
     /// If a node with the given key is found, returns an access to it, otherwise returns None.
-    /// This method is lock-free.
+    /// This method is wait-free.
     pub fn find(&self, key: &K) -> Option<SortedLazyListAccessor<K, V>> {
         let hash = self.hash(key);
         let mut curr = (*self.head).as_ref().unwrap().next.get_arc();
@@ -238,22 +258,23 @@ impl<K, V, S> SortedLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
 
     /// If a node with the given key is found, logically removes it from the list and returns an
     /// access to that node. Otherwise returns None.
-    /// This method is block-free with respect to other `remove`s and `insert`s but may wait until
+    /// This method is obstruction-free with respect to other `remove`s and `insert`s but may wait until
     /// all `find` and `contains` call are finished.
     pub fn remove(&self, key: &K) -> Option<SortedLazyListAccessor<K, V>> {
         loop {
             match self.find_pair(key) {
                 Ok(acc) => {
-                    let succ = (*acc.curr).as_ref().unwrap().next.get_arc();
-                    if !(*acc.curr).as_ref().unwrap().next.compare_arc_exchange_mark(succ.clone(), true) {
+                    let succ = (*acc.curr_or_next).as_ref().unwrap().next.get_arc();
+                    if !(*acc.curr_or_next).as_ref().unwrap().next.compare_arc_exchange_mark(succ.clone(), true) {
                         continue;
                     }
 
-                    // TODO why cannot this fail?
-                    let t = (*acc.pred).as_ref().unwrap().next.compare_exchange(acc.curr.clone(), succ, false, false);
-                    debug_assert!(t);
+                    // wtf why is this done tiwce, i.e. here and in find_pair?
+                    // possible answer: to speed things up, we try to do remove the node, but if we fail, we leave this to find_pair
+                    let t = (*acc.pred).as_ref().unwrap().next.compare_exchange(acc.curr_or_next.clone(), succ, false, false);
+                    // this might fail, oh well
 
-                    return Some( SortedLazyListAccessor { acc: acc.curr, } );
+                    return Some( SortedLazyListAccessor { acc: acc.curr_or_next, } );
                 },
                 Err(_) => {
                     return None;
@@ -263,14 +284,14 @@ impl<K, V, S> SortedLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
     }
 
     /// Checks whether a node with the given key is currently present in the list.
-    /// This method is lock-free.
+    /// This method is wait-free.
     pub fn contains(&self, key: &K) -> bool {
         self.find(key).is_some()
     }
 
-    /// Returns the number of elements currently in the list.
-    // TODO name
-    pub fn size(&self) -> usize {
+    /// Returns the number of elements currently in the list, as observed by the thread.
+    /// This method is wait-free.
+    pub fn len(&self) -> usize {
         let mut curr = (*self.head).as_ref().unwrap().next.get_arc();
 
         let mut count = 0;
@@ -288,20 +309,59 @@ impl<K, V, S> SortedLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
 mod tests {
     use std::hash::BuildHasherDefault;
     use std::hash::SipHasher;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Barrier;
+    use std::sync::atomic::Ordering;
 
-    use super::*;
     use crossbeam::scope;
 
+    use super::*;
+
     #[test]
-    fn basic() {
+    fn basic_insert() {
+        let build = BuildHasherDefault::<SipHasher>::default();
+        let list = SortedLazyList::<u32, u32, _>::with_hash_factory(build);
+        let inserted = list.insert(0, 1);
+        assert!(inserted);
+        assert!(list.find(&0).is_some());
+        assert!(*list.find(&0).unwrap() == 1);
+        assert!(list.find(&1).is_none());
+    }
+
+    #[test]
+    fn basic_remove() {
         let build = BuildHasherDefault::<SipHasher>::default();
         let list = SortedLazyList::<u32, u32, _>::with_hash_factory(build);
         list.insert(0, 1);
-        assert!(list.find(&0).is_some());
-        assert!(list.find(&1).is_none());
-        list.remove(&0);
+
+        let removed = list.remove(&0);
         assert!(list.find(&0).is_none());
-        assert!(list.find(&1).is_none());
+        assert!(removed.is_some());
+        let acc = removed.unwrap();
+        assert!(*acc == 1);
+        let val = acc.try_unwrap();
+        assert!(val.is_ok());
+        let val = val.unwrap();
+        assert!(val.0 == 0);
+        assert!(val.1 == 1);
+
+        let removed_twice = list.remove(&0);
+        assert!(removed_twice.is_none());
+    }
+
+    #[test]
+    fn basic_len() {
+        let build = BuildHasherDefault::<SipHasher>::default();
+        let list = SortedLazyList::<u32, u32, _>::with_hash_factory(build);
+        assert!(list.len() == 0);
+        list.insert(0, 1);
+        assert!(list.len() == 1);
+        list.insert(2, 3);
+        assert!(list.len() == 2);
+        list.remove(&2);
+        assert!(list.len() == 1);
+        list.remove(&0);
+        assert!(list.len() == 0);
     }
 
     const NUM_THREADS: usize = 8;
@@ -311,15 +371,38 @@ mod tests {
         let build = BuildHasherDefault::<SipHasher>::default();
         let list = SortedLazyList::<u32, u32, _>::with_hash_factory(build);
 
+        let b = Barrier::new(NUM_THREADS);
+        let u = AtomicUsize::new(0);
         scope(|scope| {
-            for _ in 0..NUM_THREADS {
+            for i in 0..NUM_THREADS {
                 scope.spawn(|| {
+                    let k = 2*u.fetch_add(1, Ordering::Relaxed) as u32;
+                    b.wait();
+                    let inserted = list.insert(k, k+1);
+                    assert!(inserted);
+                    let found = list.find(&k);
+                    assert!(found.is_some());
+                    assert!(*found.unwrap() == k+1);
+                    let removed = list.remove(&k);
+                    assert!(removed.is_some());
+                    let acc = removed.unwrap();
+                    assert!(*acc == k+1);
+                    let mut val = acc.try_unwrap();
+                    while let Err(a) = val {
+                        val = a.try_unwrap();
+                    }
+                    let val = val.unwrap();
+                    assert!(val.0 == k);
+                    assert!(val.1 == k+1);
 
-
-
+                    let removed_twice = list.remove(&k);
+                    assert!(removed_twice.is_none());
                 } );
             }
         } );
 
+        assert!(list.len() == 0);
+
+        let u = AtomicUsize::new(0);
     }
 }
