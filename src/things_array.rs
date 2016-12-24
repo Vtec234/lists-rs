@@ -1,24 +1,11 @@
-#![allow(dead_code, unused_variables)]
-#![feature(alloc, heap_api, associated_consts, unsafe_no_drop_flag,
-           dropck_parametricity, box_syntax, core_intrinsics, filling_drop)]
-extern crate alloc;
-extern crate rand;
-extern crate crossbeam;
-extern crate stm;
-extern crate core;
-
 use alloc::heap::{ allocate, deallocate };
 use std::mem::size_of;
 use std::sync::atomic::{ AtomicUsize, Ordering };
+use std;
 
-
-pub mod atomic;
-pub mod carc;
-pub mod list;
-
-pub struct Entry {
-	pub key: AtomicUsize,
-	pub value: AtomicUsize,
+struct Entry {
+    key: AtomicUsize,
+	value: AtomicUsize,
 }
 
 impl Entry {
@@ -38,7 +25,7 @@ const ARRAY_OF_THINGS_COUNT: usize = 16384;
 const PAGE_SIZE: usize = 4096;
 
 impl ArrayOfThings {
-	fn new() -> ArrayOfThings {
+	pub fn new() -> ArrayOfThings {
 		unsafe {
 			let arr = ArrayOfThings {
 				entries: allocate(ARRAY_OF_THINGS_COUNT * size_of::<Entry>(), PAGE_SIZE) as *mut Entry,
@@ -55,7 +42,7 @@ impl ArrayOfThings {
 		}
 	}
 
-	fn set_item(&self, key: usize, value: usize) {
+	pub fn set_item(&self, key: usize, value: usize) {
 		let mut at: usize = 0;
 		unsafe {
 			let slice = std::slice::from_raw_parts_mut(self.entries, ARRAY_OF_THINGS_COUNT);
@@ -74,7 +61,7 @@ impl ArrayOfThings {
 		}
 	}
 
-	fn get_item(&self, key: usize) -> usize {
+	pub fn get_item(&self, key: usize) -> usize {
 		let mut at: usize = 0;
 		unsafe {
 			let slice = std::slice::from_raw_parts(self.entries, ARRAY_OF_THINGS_COUNT);
