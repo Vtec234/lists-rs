@@ -92,9 +92,9 @@ unsafe impl Send for ArrayOfThings {}
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use rand::{ Rng, StdRng };
+	use rand::{Rng, XorShiftRng};
 	use std::sync::Arc;
-	use std::thread::{ spawn, JoinHandle };
+	use std::thread::{spawn, JoinHandle};
 	use std::collections::HashMap;
 
 	#[test]
@@ -106,7 +106,7 @@ mod tests {
 			let the_arr = arr.clone();
 			threads.push(
 				spawn(move || {
-					let mut rand = StdRng::new().unwrap();
+					let mut rand = XorShiftRng::new_unseeded();
 					let mut store: HashMap<usize, usize> = HashMap::new();
 					for i in 1+range*2000..2001+range*2000 {
 						let mut val: usize = 0;

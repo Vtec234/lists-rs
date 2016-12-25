@@ -20,7 +20,7 @@ struct Node<K, V> {
     // A list of pointer to the next node for each skiplist level.
     // A marker value of true indicates that this node has been logically deleted
     // on the given level.
-    next: SomeSortOfListOrArray<MarkableArcCell<Option<Node<K, V>>>>,
+    //next: SomeSortOfListOrArray<MarkableArcCell<Option<Node<K, V>>>>,
 }
 
 impl<K, V, S> SortedLazySkiplist<K, V, S> where K: Eq + Hash, S: BuildHasher {
