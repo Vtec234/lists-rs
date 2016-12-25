@@ -1,8 +1,9 @@
-#![feature(alloc, heap_api, associated_consts, dropck_parametricity, box_syntax, rand)]
+#![feature(alloc, heap_api, associated_consts, dropck_parametricity, box_syntax, rand, test)]
 extern crate alloc;
 extern crate rand;
 extern crate crossbeam;
 extern crate core;
+extern crate test;
 
 mod things_array;
 mod sorted_lazy_list;

@@ -68,11 +68,10 @@ impl<K, V, S> Drop for SortedLazyList<K, V, S> {
         use std::ptr;
 
         unsafe {
-            // First drop the actual node after `head`.
+            // First drop the actual node after `head`
             ptr::drop_in_place(&mut Arc::get_mut(&mut self.head).unwrap().as_mut().unwrap().next as *mut MarkableArcCell<Option<Node<K, V>>>);
 
-            // Then drop the fake head node.
-            // TODO is this enough to set it to None?
+            // Then replace and forget the fake head node without dropping it
             let fake_head_opt = ptr::replace(
                 Arc::get_mut(&mut self.head).unwrap() as *mut Option<Node<K, V>>,
                 None
@@ -88,7 +87,7 @@ impl<K, V, S> SortedLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
         use std::ptr;
 
         // we construct an unsafe fake head node so that the types of `pred` when performing operations
-        // can be uniform. surely there exists a nicer way to do hits, but i don't know it
+        // can be uniform. surely there exists a nicer way to do this, but i don't know it
         let mut fake_head: Node<K, V> = unsafe { mem::zeroed() };
         unsafe {
             ptr::write_bytes(
@@ -137,12 +136,12 @@ impl<K, V, S> SortedLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
                 // c'mon rust, this should be (succ, curr_marked) = ...
                 let pr = (*curr).as_ref().unwrap().next.get();
                 // successor node
-                let mut succ = pr.0;
+                let succ = pr.0;
                 // marked nodes are logically deleted. this routine deletes them physically
-                let mut curr_marked = pr.1;
+                let curr_marked = pr.1;
 
-                while curr_marked {
-                    // a CAS failure indicated that another thread messed with the predecessor node
+                if curr_marked {
+                    // a CAS failure indicates that another thread messed with the predecessor node
                     // in which case we restart from head
                     if !(*pred).as_ref().unwrap().next.compare_exchange(
                         curr.clone(),
@@ -153,20 +152,9 @@ impl<K, V, S> SortedLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
                         continue 'begin_from_head;
                     }
 
-                    if (*succ).is_none() {
-                        // we reached the end of the list
-                        return Err(NodeAccess {
-                            pred: pred,
-                            // next
-                            curr_or_next: succ,
-                        } );
-                    }
-
-                    // move over the removed node. pred stays the same, curr and succ advance
+                    // move over the removed node. pred stays the same, only curr advances
                     curr = succ;
-                    let pr = (*curr).as_ref().unwrap().next.get();
-                    succ = pr.0;
-                    curr_marked = pr.1;
+                    continue;
                 }
 
                 let curr_hash = (*curr).as_ref().unwrap().hash;
@@ -188,7 +176,7 @@ impl<K, V, S> SortedLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
 
                 pred = curr;
                 curr = succ;
-            }
+            } // while
 
             return Err(NodeAccess {
                     pred: pred,
@@ -201,7 +189,7 @@ impl<K, V, S> SortedLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
     /// Forces physical removal of all logically removed nodes. Useful if the user wants to
     /// retrieve the raw key and value from a node accessor, but the node is still owned by
     /// the list.
-    pub fn cleanup(&self) { 
+    pub fn cleanup(&self) {
         'begin_from_head: loop {
             // predecessor. the initial value of `self.head` is an invalid node and so its hash or
             // key are never checked
@@ -213,12 +201,12 @@ impl<K, V, S> SortedLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
                 // c'mon rust, this should be (succ, curr_marked) = ...
                 let pr = (*curr).as_ref().unwrap().next.get();
                 // successor node
-                let mut succ = pr.0;
+                let succ = pr.0;
                 // marked nodes are logically deleted. this routine deletes them physically
-                let mut curr_marked = pr.1;
+                let curr_marked = pr.1;
 
-                while curr_marked {
-                    // a CAS failure indicated that another thread messed with the predecessor node
+                if curr_marked {
+                    // a CAS failure indicates that another thread messed with the predecessor node
                     // in which case we restart from head
                     if !(*pred).as_ref().unwrap().next.compare_exchange(
                         curr.clone(),
@@ -229,21 +217,14 @@ impl<K, V, S> SortedLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
                         continue 'begin_from_head;
                     }
 
-                    if (*succ).is_none() {
-                        // we reached the end of the list
-                        return;
-                    }
-
-                    // move over the removed node. pred stays the same, curr and succ advance
+                    // move over the removed node. pred stays the same, only curr advances
                     curr = succ;
-                    let pr = (*curr).as_ref().unwrap().next.get();
-                    succ = pr.0;
-                    curr_marked = pr.1;
+                    continue;
                 }
 
                 pred = curr;
                 curr = succ;
-            }
+            } // while
 
             return;
         } // loop
@@ -359,19 +340,20 @@ impl<K, V, S> SortedLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
 #[cfg(test)]
 mod tests {
     use std::hash::BuildHasherDefault;
-    use std::hash::SipHasher;
-    use std::sync::atomic::AtomicUsize;
+    use std::collections::hash_map::DefaultHasher;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Barrier;
-    use std::sync::atomic::Ordering;
 
-    use crossbeam::scope;
+    use test::Bencher;
+
+    use crossbeam::{scope, spawn_unsafe};
 
     use super::*;
 
 
     #[test]
     fn basic_insert() {
-        let build = BuildHasherDefault::<SipHasher>::default();
+        let build = BuildHasherDefault::<DefaultHasher>::default();
         let list = SortedLazyList::<u32, u32, _>::with_hash_factory(build);
         let inserted = list.insert(0, 1);
         assert!(inserted);
@@ -382,7 +364,7 @@ mod tests {
 
     #[test]
     fn basic_remove() {
-        let build = BuildHasherDefault::<SipHasher>::default();
+        let build = BuildHasherDefault::<DefaultHasher>::default();
         let list = SortedLazyList::<u32, u32, _>::with_hash_factory(build);
         list.insert(0, 1);
 
@@ -404,7 +386,7 @@ mod tests {
 
     #[test]
     fn basic_len() {
-        let build = BuildHasherDefault::<SipHasher>::default();
+        let build = BuildHasherDefault::<DefaultHasher>::default();
         let list = SortedLazyList::<u32, u32, _>::with_hash_factory(build);
         assert!(list.len() == 0);
         list.insert(0, 1);
@@ -417,13 +399,13 @@ mod tests {
         assert!(list.len() == 0);
     }
 
-    const NUM_THREADS: usize = 32;
+    const NUM_THREADS: usize = 4;
 
     // newtype wrapper that defaults to move in closures
     struct U32(u32);
     #[test]
     fn concurrent() {
-        let build = BuildHasherDefault::<SipHasher>::default();
+        let build = BuildHasherDefault::<DefaultHasher>::default();
         let list = SortedLazyList::<u32, u32, _>::with_hash_factory(build);
 
         // general test of concurrent operations
@@ -504,5 +486,55 @@ mod tests {
 
     }
 
-    // TODO more tests!
+    const BENCH_ITERS: usize = 1000;
+
+    #[bench]
+    fn bench_insert_st(b: &mut Bencher) {
+        let build = BuildHasherDefault::<DefaultHasher>::default();
+        let list = SortedLazyList::<u32, u32, _>::with_hash_factory(build);
+
+        b.iter(move || {
+            for i in 0..BENCH_ITERS {
+                list.insert(i as u32, 1337);
+            }
+        } );
+    }
+
+    #[bench]
+    fn bench_insert_mt(b: &mut Bencher) {
+        let build = BuildHasherDefault::<DefaultHasher>::default();
+        let list = SortedLazyList::<u32, u32, _>::with_hash_factory(build);
+        let mut handles = Vec::new();
+
+        let count = AtomicUsize::new(NUM_THREADS);
+        let val = AtomicUsize::new(0);
+        let done = AtomicUsize::new(0);
+        // each thread waits for `flip` to flip to 1, does its thing, and decrements count
+        for _ in 0..NUM_THREADS {
+            handles.push(unsafe { spawn_unsafe(|| {
+                let mut prev_val = 0;
+                while done.load(Ordering::Relaxed) == 0 {
+                    if val.load(Ordering::Relaxed) != prev_val {
+                        prev_val = val.load(Ordering::Relaxed);
+                        for i in 0..(BENCH_ITERS/NUM_THREADS) {
+                            list.insert(i as u32, 1337);
+                        }
+                        count.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
+            } ) } );
+        }
+
+        b.iter(|| {
+            val.fetch_add(1, Ordering::Relaxed);
+            while count.load(Ordering::Relaxed) != 0 {}
+            count.store(NUM_THREADS, Ordering::SeqCst);
+        } );
+
+        done.store(1, Ordering::Relaxed);
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
 }
