@@ -41,8 +41,9 @@ pub struct SortedLazyListAccessor<K, V> {
 
 impl<K, V> SortedLazyListAccessor<K, V> {
     /// This method only has a chance to work on a recently removed node. That is, in the case when it
-    /// is returned from list.remove(). Even then, it might still be co-owned by another thread. It returns
-    /// the key and value if it succeeds, the same accessor otherwise.
+    /// is returned from `remove()`` and physically removed later (either lazily or using `cleanup()`).
+    /// Even then, it might still be co-owned by another thread. It returns the key and value
+    /// if it succeeds, the same accessor otherwise.
     pub fn try_unwrap(self) -> Result<(K, V), Self> {
         match Arc::try_unwrap(self.acc) {
             Ok(opt) => {
@@ -88,23 +89,23 @@ impl<K, V, S> SortedLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
 
         // we construct an unsafe fake head node so that the types of `pred` when performing operations
         // can be uniform. surely there exists a nicer way to do this, but i don't know it
-        let mut fake_head: Node<K, V> = unsafe { mem::zeroed() };
+        let mut head_fake: Node<K, V> = unsafe { mem::zeroed() };
         unsafe {
             ptr::write_bytes(
-                &mut fake_head as *mut Node<K, V>,
+                &mut head_fake as *mut Node<K, V>,
                 // the optimizer thinks zeroed memory is the None variant, so fill with 0xAB
                 0xAB,
                 1
             );
             ptr::write(
-                &mut fake_head.next as *mut MarkableArcCell<Option<Node<K, V>>>,
+                &mut head_fake.next as *mut MarkableArcCell<Option<Node<K, V>>>,
                 // this sentinel marks the end of the list
                 MarkableArcCell::new(Arc::new(None), false)
             );
         }
 
         SortedLazyList {
-            head: Arc::new(Some(fake_head)),
+            head: Arc::new(Some(head_fake)),
             hasher_factory: f,
         }
     }
@@ -292,25 +293,26 @@ impl<K, V, S> SortedLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
     /// This method is obstruction-free with respect to other `remove`s and `insert`s but may wait until
     /// all `find` and `contains` call are finished.
     pub fn remove(&self, key: &K) -> Option<SortedLazyListAccessor<K, V>> {
-        loop {
-            match self.find_pair(key) {
-                Ok(acc) => {
-                    let succ = (*acc.curr_or_next).as_ref().unwrap().next.get_arc();
-                    if !(*acc.curr_or_next).as_ref().unwrap().next.compare_exchange(succ.clone(), succ.clone(), false, true) {
-                        continue;
-                    }
-
-                    // we immediately try to physically remove the node. if we fail, the node will
-                    // have to be removed later
-                    (*acc.pred).as_ref().unwrap().next.compare_exchange(acc.curr_or_next.clone(), succ, false, false);
-
-                    return Some( SortedLazyListAccessor { acc: acc.curr_or_next, } );
-                },
-                Err(_) => {
-                    return None;
-                },
+        self.find_pair(key).ok().and_then(|acc| {
+            let mut pr = (*acc.curr_or_next).as_ref().unwrap().next.get();
+            let mut i_marked_it = false;
+            while !pr.1 {
+                // TODO is it necessary to check if node still points to pr.0? maybe use next.compare_exchange_mark?
+                i_marked_it = (*acc.curr_or_next).as_ref().unwrap().next.compare_exchange(pr.0.clone(), pr.0.clone(), false, true);
+                pr = (*acc.curr_or_next).as_ref().unwrap().next.get();
             }
-        }
+
+            // we immediately try to physically remove the node. if we fail, the node will
+            // have to be removed later
+            (*acc.pred).as_ref().unwrap().next.compare_exchange(acc.curr_or_next.clone(), pr.0, false, false);
+
+            if i_marked_it {
+                Some( SortedLazyListAccessor { acc: acc.curr_or_next, } )
+            }
+            else {
+                None
+            }
+        } )
     }
 
     /// Checks whether a node with the given key is currently present in the list.
