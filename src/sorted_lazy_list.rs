@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::hash::{Hash, Hasher, BuildHasher};
 use std::ops::Deref;
+use std::cmp;
 
 use crossbeam::sync::MarkableArcCell;
 
@@ -10,29 +11,64 @@ use crossbeam::sync::MarkableArcCell;
 #[derive(Debug)]
 // TODO explicit Send and Sync. right now it's implicitly (i think) as Send and Sync as K and V
 pub struct ConcurrentLazyList<K, V, S> {
-    head: Arc<Option<Node<K, V>>>,
+    head: Arc<Node<K, V>>,
     hasher_factory: S,
 }
 
-enum ExpNode<K, V> {
+#[derive(Debug)]
+enum Node<K, V> {
+    /// The head of the list is its first node. It always exists and contains no data.
     Head {
-        next: Arc<ExpNode<K, V>>,
+        // TODO this could be ArcCell if we add CAS to that
+        next: MarkableArcCell<Node<K, V>>,
     },
+    /// A single node in the linked list, containg a key and a value.
     Data {
         hash: u64,
+        // TODO can we make this work for unsized types?
         key: K,
         val: V,
-        next: MarkableArcCell<ExpNode<K, V>>,
+
+        // A marker value of `true` indicates that this node has been logically deleted.
+        next: MarkableArcCell<Node<K, V>>,
     },
+    /// The tail is the list's last node.
     Tail
 }
 
-use std::cmp;
+impl<K, V> Node<K, V> {
+    fn next(&self) -> &MarkableArcCell<Node<K, V>> {
+        use self::Node::*;
 
-impl<K, V> cmp::PartialEq<u64> for ExpNode<K, V> {
+        match self {
+            &Head { ref next } => next,
+            &Data { ref next, .. } => next,
+            _ => panic!(),
+        }
+    }
+
+    fn is_data(&self) -> bool {
+        use self::Node::*;
+
+        if let &Data { .. } = self { true } else { false }
+    }
+
+    fn key(&self) -> &K {
+        use self::Node::*;
+
+        if let &Data { ref key, .. } = self { key } else { panic!() }
+    }
+
+    fn hash(&self) -> u64 {
+        use self::Node::*;
+
+        if let &Data { hash, .. } = self { hash } else { panic!() }
+    }
+}
+
+impl<K, V> cmp::PartialEq<u64> for Node<K, V> {
     fn eq(&self, other: &u64) -> bool {
-        use self::ExpNode::*;
-        if let Data { hash, .. } = *self {
+        if let Node::Data { hash, .. } = *self {
             hash.eq(other)
         }
         else {
@@ -40,9 +76,10 @@ impl<K, V> cmp::PartialEq<u64> for ExpNode<K, V> {
         }
     }
 }
-impl<K, V> cmp::PartialOrd<u64> for ExpNode<K, V> {
+
+impl<K, V> cmp::PartialOrd<u64> for Node<K, V> {
     fn partial_cmp(&self, other: &u64) -> Option<cmp::Ordering> {
-        use self::ExpNode::*;
+        use self::Node::*;
         match *self {
             Head { .. } => Some(cmp::Ordering::Less),
             Data { hash, .. } => hash.partial_cmp(other),
@@ -51,30 +88,17 @@ impl<K, V> cmp::PartialOrd<u64> for ExpNode<K, V> {
     }
 }
 
-/// A single node in the linked list, containg a key and a value.
-#[derive(Debug)]
-struct Node<K, V> {
-    hash: u64,
-    // TODO can we make this work for unsized types?
-    key: K,
-    val: V,
-
-    // A marker value of `true` indicates that this node has been logically deleted.
-    next: MarkableArcCell<Option<Node<K, V>>>,
-}
-
 /// A pair of (hopefully :]) consecutive nodes for internal access.
 #[derive(Debug)]
 struct NodeAccess<K, V> {
-    pred: Arc<Option<Node<K, V>>>,
-    curr_or_next: Arc<Option<Node<K, V>>>,
+    pred: Arc<Node<K, V>>,
+    curr_or_next: Arc<Node<K, V>>,
 }
 
 /// Provides access to nodes in the list.
 #[derive(Debug)]
 pub struct ConcurrentLazyListAccessor<K, V> {
-    // This should never be None. It's only an Option so that the type is the same as in the list.
-    acc: Arc<Option<Node<K, V>>>,
+    acc: Arc<Node<K, V>>,
 }
 
 impl<K, V> ConcurrentLazyListAccessor<K, V> {
@@ -84,9 +108,13 @@ impl<K, V> ConcurrentLazyListAccessor<K, V> {
     /// if it succeeds, the same accessor otherwise.
     pub fn try_unwrap(self) -> Result<(K, V), Self> {
         match Arc::try_unwrap(self.acc) {
-            Ok(opt) => {
-                let unwrapped = opt.unwrap();
-                Ok((unwrapped.key, unwrapped.val))
+            Ok(node) => {
+                if let Node::Data { key, val, .. } = node {
+                    Ok((key, val))
+                }
+                else {
+                    panic!();
+                }
             },
             Err(arc) => Err( ConcurrentLazyListAccessor { acc: arc, } ),
         }
@@ -97,53 +125,19 @@ impl<K, V> Deref for ConcurrentLazyListAccessor<K, V> {
     type Target = V;
 
     fn deref(&self) -> &V {
-        &(*self.acc).as_ref().unwrap().val
-    }
-}
-
-impl<K, V, S> Drop for ConcurrentLazyList<K, V, S> {
-    fn drop(&mut self) {
-        use std::mem;
-        use std::ptr;
-
-        unsafe {
-            // First drop the actual node after `head`
-            ptr::drop_in_place(&mut Arc::get_mut(&mut self.head).unwrap().as_mut().unwrap().next as *mut MarkableArcCell<Option<Node<K, V>>>);
-
-            // Then replace and forget the fake head node without dropping it
-            let fake_head_opt = ptr::replace(
-                Arc::get_mut(&mut self.head).unwrap() as *mut Option<Node<K, V>>,
-                None
-            );
-            mem::forget(fake_head_opt);
+        if let Node::Data { ref val, .. } = *self.acc {
+            val
+        }
+        else {
+            panic!();
         }
     }
 }
 
 impl<K, V, S> ConcurrentLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
     pub fn with_hash_factory(f: S) -> Self {
-        use std::mem;
-        use std::ptr;
-
-        // we construct an unsafe fake head node so that the types of `pred` when performing operations
-        // can be uniform. surely there exists a nicer way to do this, but i don't know it
-        let mut head_fake: Node<K, V> = unsafe { mem::zeroed() };
-        unsafe {
-            ptr::write_bytes(
-                &mut head_fake as *mut Node<K, V>,
-                // the optimizer thinks zeroed memory is the None variant, so fill with 0xAB
-                0xAB,
-                1
-            );
-            ptr::write(
-                &mut head_fake.next as *mut MarkableArcCell<Option<Node<K, V>>>,
-                // this sentinel marks the end of the list
-                MarkableArcCell::new(Arc::new(None), false)
-            );
-        }
-
         ConcurrentLazyList {
-            head: Arc::new(Some(head_fake)),
+            head: Arc::new(Node::Head { next: MarkableArcCell::new(Arc::new(Node::Tail), false) } ),
             hasher_factory: f,
         }
     }
@@ -165,29 +159,28 @@ impl<K, V, S> ConcurrentLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
         let hash = self.hash(key);
 
         'begin_from_head: loop {
-            // predecessor. the initial value of `self.head` is an invalid node and so its hash or
-            // key are never checked
+            // predecessor. the inital value is Node::Head
             let mut pred = self.head.clone();
             // currently looked at
-            let mut curr = (*pred).as_ref().unwrap().next.get_arc();
+            let mut curr = pred.next().get_arc();
 
-            while curr.is_some() {
+            while curr.is_data() {
                 // c'mon rust, this should be (succ, curr_marked) = ...
-                let pr = (*curr).as_ref().unwrap().next.get();
+                let pr = curr.next().get();
                 // successor node
                 let succ = pr.0;
                 // marked nodes are logically deleted. this routine deletes them physically
                 let curr_marked = pr.1;
 
                 if curr_marked {
-                    // a CAS failure indicates that another thread messed with the predecessor node
-                    // in which case we restart from head
-                    if !(*pred).as_ref().unwrap().next.compare_exchange(
+                    if !pred.next().compare_exchange(
                         curr.clone(),
                         succ.clone(),
                         false,
                         false
                     ) {
+                        // a CAS failure indicates that another thread messed with the predecessor node
+                        // in which case we restart from head
                         continue 'begin_from_head;
                     }
 
@@ -196,16 +189,15 @@ impl<K, V, S> ConcurrentLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
                     continue;
                 }
 
-                let curr_hash = (*curr).as_ref().unwrap().hash;
-                if curr_hash == hash
-                && &(*curr).as_ref().unwrap().key == key {
+                if curr.hash() == hash
+                && curr.key() == key {
                     return Ok(NodeAccess {
                         pred: pred,
                         // curr
                         curr_or_next: curr,
                     } );
                 }
-                else if curr_hash > hash {
+                else if curr.hash() > hash {
                     return Err(NodeAccess {
                         pred: pred,
                         // next
@@ -230,29 +222,28 @@ impl<K, V, S> ConcurrentLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
     /// the list.
     pub fn cleanup(&self) {
         'begin_from_head: loop {
-            // predecessor. the initial value of `self.head` is an invalid node and so its hash or
-            // key are never checked
+            // predecessor. initial value is Node::Head
             let mut pred = self.head.clone();
             // currently looked at
-            let mut curr = (*pred).as_ref().unwrap().next.get_arc();
+            let mut curr = pred.next().get_arc();
 
-            while curr.is_some() {
+            while curr.is_data() {
                 // c'mon rust, this should be (succ, curr_marked) = ...
-                let pr = (*curr).as_ref().unwrap().next.get();
+                let pr = curr.next().get();
                 // successor node
                 let succ = pr.0;
                 // marked nodes are logically deleted. this routine deletes them physically
                 let curr_marked = pr.1;
 
                 if curr_marked {
-                    // a CAS failure indicates that another thread messed with the predecessor node
-                    // in which case we restart from head
-                    if !(*pred).as_ref().unwrap().next.compare_exchange(
+                    if !pred.next().compare_exchange(
                         curr.clone(),
                         succ.clone(),
                         false,
                         false
                     ) {
+                        // a CAS failure indicates that another thread messed with the predecessor node
+                        // in which case we restart from head
                         continue 'begin_from_head;
                     }
 
@@ -272,23 +263,23 @@ impl<K, V, S> ConcurrentLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
     /// Inserts a key-value pair into the list. Fails if a node with the given key already exists.
     /// Returns whether the insert was successful.
     pub fn insert(&self, key: K, val: V) -> bool {
-        let new = Arc::new( Some( Node {
+        let new = Arc::new( Node::Data {
             hash: self.hash(&key),
             key: key,
             val: val,
 
-            next: MarkableArcCell::new(Arc::new(None), false),
-        }));
+            next: MarkableArcCell::new(Arc::new(Node::Tail), false),
+        } );
 
         loop {
-            match self.find_pair(&(*new).as_ref().unwrap().key) {
+            match self.find_pair(new.key()) {
                 Ok(_) => {
                     // a node with this key already exists
                     return false;
                 },
                 Err(acc) => {
-                    (*new).as_ref().unwrap().next.set(acc.curr_or_next.clone(), false);
-                    if (*acc.pred).as_ref().unwrap().next.compare_exchange(acc.curr_or_next, new.clone(), false, false) {
+                    new.next().set(acc.curr_or_next.clone(), false);
+                    if acc.pred.next().compare_exchange(acc.curr_or_next, new.clone(), false, false) {
                         return true;
                     }
                     // if CAS failed, redo search
@@ -301,17 +292,15 @@ impl<K, V, S> ConcurrentLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
     /// This method is wait-free.
     pub fn find(&self, key: &K) -> Option<ConcurrentLazyListAccessor<K, V>> {
         let hash = self.hash(key);
-        let mut curr = (*self.head).as_ref().unwrap().next.get_arc();
+        let mut curr = self.head.next().get_arc();
 
-        while curr.is_some() {
-            let curr_hash = (*curr).as_ref().unwrap().hash;
-
-            if curr_hash < hash {
-                curr = (*curr).as_ref().unwrap().next.get_arc();
+        while curr.is_data() {
+            if curr.hash() < hash {
+                curr = curr.next().get_arc();
             }
-            else if curr_hash == hash
-            && &(*curr).as_ref().unwrap().key == key
-            && !(*curr).as_ref().unwrap().next.is_marked() {
+            else if curr.hash() == hash
+            && curr.key() == key
+            && !curr.next().is_marked() {
                 return Some( ConcurrentLazyListAccessor {
                     acc: curr,
                 } );
@@ -328,17 +317,17 @@ impl<K, V, S> ConcurrentLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
     /// access to that node. Otherwise returns None.
     pub fn remove(&self, key: &K) -> Option<ConcurrentLazyListAccessor<K, V>> {
         self.find_pair(key).ok().and_then(|acc| {
-            let mut pr = (*acc.curr_or_next).as_ref().unwrap().next.get();
+            let mut pr = acc.curr_or_next.next().get();
             let mut i_marked_it = false;
             while !pr.1 {
                 // TODO is it necessary to check if node still points to pr.0? maybe use next.compare_exchange_mark?
-                i_marked_it = (*acc.curr_or_next).as_ref().unwrap().next.compare_exchange(pr.0.clone(), pr.0.clone(), false, true);
-                pr = (*acc.curr_or_next).as_ref().unwrap().next.get();
+                i_marked_it = acc.curr_or_next.next().compare_exchange(pr.0.clone(), pr.0.clone(), false, true);
+                pr = acc.curr_or_next.next().get();
             }
 
             // we immediately try to physically remove the node. if we fail, the node will
             // have to be removed later
-            (*acc.pred).as_ref().unwrap().next.compare_exchange(acc.curr_or_next.clone(), pr.0, false, false);
+            acc.pred.next().compare_exchange(acc.curr_or_next.clone(), pr.0, false, false);
 
             if i_marked_it {
                 Some( ConcurrentLazyListAccessor { acc: acc.curr_or_next, } )
@@ -358,14 +347,14 @@ impl<K, V, S> ConcurrentLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
     /// Returns the number of elements currently in the list, as observed by the thread.
     /// This method is wait-free.
     pub fn len(&self) -> usize {
-        let mut curr = (*self.head).as_ref().unwrap().next.get_arc();
+        let mut curr = self.head.next().get_arc();
 
         let mut count = 0;
-        while curr.is_some() {
-            if !(*curr).as_ref().unwrap().next.is_marked() {
+        while curr.is_data() {
+            if !curr.next().is_marked() {
                 count = count + 1;
             }
-            curr = (*curr).as_ref().unwrap().next.get_arc();
+            curr = curr.next().get_arc();
         }
 
         count
