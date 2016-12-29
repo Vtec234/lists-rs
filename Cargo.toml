@@ -5,3 +5,6 @@ authors = ["Wojciech Nawrocki <wjnawrocki+gh@protonmail.com>"]
 
 [dependencies]
 crossbeam = { git = "https://github.com/Vtec234/crossbeam", branch = "lazy-list-map" }
+#crossbeam = { path = "../crossbeam" }
+
+init_with = "1.0.0"

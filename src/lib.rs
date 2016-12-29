@@ -4,6 +4,7 @@ extern crate rand;
 extern crate crossbeam;
 extern crate core;
 extern crate test;
+extern crate init_with;
 
 mod things_array;
 mod sorted_lazy_list;

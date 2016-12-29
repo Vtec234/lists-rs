@@ -4,13 +4,51 @@ use std::ops::Deref;
 
 use crossbeam::sync::MarkableArcCell;
 
-
-/// A concurrent lock-free linked list with elements sorted by the key's hash and then by the key itself.
+/// This is a concurrent lock-free singly linked list. Internally, its nodes are sorted by the key's hash.
+/// It provides wait-freedom guarantees on some of its methods.
+/// Most operations on this structure are O(n).
 #[derive(Debug)]
 // TODO explicit Send and Sync. right now it's implicitly (i think) as Send and Sync as K and V
-pub struct SortedLazyList<K, V, S> {
+pub struct ConcurrentLazyList<K, V, S> {
     head: Arc<Option<Node<K, V>>>,
     hasher_factory: S,
+}
+
+enum ExpNode<K, V> {
+    Head {
+        next: Arc<ExpNode<K, V>>,
+    },
+    Data {
+        hash: u64,
+        key: K,
+        val: V,
+        next: MarkableArcCell<ExpNode<K, V>>,
+    },
+    Tail
+}
+
+use std::cmp;
+
+impl<K, V> cmp::PartialEq<u64> for ExpNode<K, V> {
+    fn eq(&self, other: &u64) -> bool {
+        use self::ExpNode::*;
+        if let Data { hash, .. } = *self {
+            hash.eq(other)
+        }
+        else {
+            false
+        }
+    }
+}
+impl<K, V> cmp::PartialOrd<u64> for ExpNode<K, V> {
+    fn partial_cmp(&self, other: &u64) -> Option<cmp::Ordering> {
+        use self::ExpNode::*;
+        match *self {
+            Head { .. } => Some(cmp::Ordering::Less),
+            Data { hash, .. } => hash.partial_cmp(other),
+            Tail => Some(cmp::Ordering::Greater),
+        }
+    }
 }
 
 /// A single node in the linked list, containg a key and a value.
@@ -34,12 +72,12 @@ struct NodeAccess<K, V> {
 
 /// Provides access to nodes in the list.
 #[derive(Debug)]
-pub struct SortedLazyListAccessor<K, V> {
+pub struct ConcurrentLazyListAccessor<K, V> {
     // This should never be None. It's only an Option so that the type is the same as in the list.
     acc: Arc<Option<Node<K, V>>>,
 }
 
-impl<K, V> SortedLazyListAccessor<K, V> {
+impl<K, V> ConcurrentLazyListAccessor<K, V> {
     /// This method only has a chance to work on a recently removed node. That is, in the case when it
     /// is returned from `remove()`` and physically removed later (either lazily or using `cleanup()`).
     /// Even then, it might still be co-owned by another thread. It returns the key and value
@@ -50,12 +88,12 @@ impl<K, V> SortedLazyListAccessor<K, V> {
                 let unwrapped = opt.unwrap();
                 Ok((unwrapped.key, unwrapped.val))
             },
-            Err(arc) => Err( SortedLazyListAccessor { acc: arc, } ),
+            Err(arc) => Err( ConcurrentLazyListAccessor { acc: arc, } ),
         }
     }
 }
 
-impl<K, V> Deref for SortedLazyListAccessor<K, V> {
+impl<K, V> Deref for ConcurrentLazyListAccessor<K, V> {
     type Target = V;
 
     fn deref(&self) -> &V {
@@ -63,7 +101,7 @@ impl<K, V> Deref for SortedLazyListAccessor<K, V> {
     }
 }
 
-impl<K, V, S> Drop for SortedLazyList<K, V, S> {
+impl<K, V, S> Drop for ConcurrentLazyList<K, V, S> {
     fn drop(&mut self) {
         use std::mem;
         use std::ptr;
@@ -82,7 +120,7 @@ impl<K, V, S> Drop for SortedLazyList<K, V, S> {
     }
 }
 
-impl<K, V, S> SortedLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
+impl<K, V, S> ConcurrentLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
     pub fn with_hash_factory(f: S) -> Self {
         use std::mem;
         use std::ptr;
@@ -104,7 +142,7 @@ impl<K, V, S> SortedLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
             );
         }
 
-        SortedLazyList {
+        ConcurrentLazyList {
             head: Arc::new(Some(head_fake)),
             hasher_factory: f,
         }
@@ -233,8 +271,6 @@ impl<K, V, S> SortedLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
 
     /// Inserts a key-value pair into the list. Fails if a node with the given key already exists.
     /// Returns whether the insert was successful.
-    /// This method is obstruction-free with respect to other `remove`s and `insert`s but may wait until
-    /// all `find` and `contains` call are finished.
     pub fn insert(&self, key: K, val: V) -> bool {
         let new = Arc::new( Some( Node {
             hash: self.hash(&key),
@@ -263,7 +299,7 @@ impl<K, V, S> SortedLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
 
     /// If a node with the given key is found, returns an access to it, otherwise returns None.
     /// This method is wait-free.
-    pub fn find(&self, key: &K) -> Option<SortedLazyListAccessor<K, V>> {
+    pub fn find(&self, key: &K) -> Option<ConcurrentLazyListAccessor<K, V>> {
         let hash = self.hash(key);
         let mut curr = (*self.head).as_ref().unwrap().next.get_arc();
 
@@ -276,7 +312,7 @@ impl<K, V, S> SortedLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
             else if curr_hash == hash
             && &(*curr).as_ref().unwrap().key == key
             && !(*curr).as_ref().unwrap().next.is_marked() {
-                return Some( SortedLazyListAccessor {
+                return Some( ConcurrentLazyListAccessor {
                     acc: curr,
                 } );
             }
@@ -290,9 +326,7 @@ impl<K, V, S> SortedLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
 
     /// If a node with the given key is found, logically removes it from the list and returns an
     /// access to that node. Otherwise returns None.
-    /// This method is obstruction-free with respect to other `remove`s and `insert`s but may wait until
-    /// all `find` and `contains` call are finished.
-    pub fn remove(&self, key: &K) -> Option<SortedLazyListAccessor<K, V>> {
+    pub fn remove(&self, key: &K) -> Option<ConcurrentLazyListAccessor<K, V>> {
         self.find_pair(key).ok().and_then(|acc| {
             let mut pr = (*acc.curr_or_next).as_ref().unwrap().next.get();
             let mut i_marked_it = false;
@@ -307,7 +341,7 @@ impl<K, V, S> SortedLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
             (*acc.pred).as_ref().unwrap().next.compare_exchange(acc.curr_or_next.clone(), pr.0, false, false);
 
             if i_marked_it {
-                Some( SortedLazyListAccessor { acc: acc.curr_or_next, } )
+                Some( ConcurrentLazyListAccessor { acc: acc.curr_or_next, } )
             }
             else {
                 None
@@ -356,7 +390,7 @@ mod tests {
     #[test]
     fn basic_insert() {
         let build = BuildHasherDefault::<DefaultHasher>::default();
-        let list = SortedLazyList::<u32, u32, _>::with_hash_factory(build);
+        let list = ConcurrentLazyList::<u32, u32, _>::with_hash_factory(build);
         let inserted = list.insert(0, 1);
         assert!(inserted);
         assert!(list.find(&0).is_some());
@@ -367,7 +401,7 @@ mod tests {
     #[test]
     fn basic_remove() {
         let build = BuildHasherDefault::<DefaultHasher>::default();
-        let list = SortedLazyList::<u32, u32, _>::with_hash_factory(build);
+        let list = ConcurrentLazyList::<u32, u32, _>::with_hash_factory(build);
         list.insert(0, 1);
 
         let removed = list.remove(&0);
@@ -389,7 +423,7 @@ mod tests {
     #[test]
     fn basic_len() {
         let build = BuildHasherDefault::<DefaultHasher>::default();
-        let list = SortedLazyList::<u32, u32, _>::with_hash_factory(build);
+        let list = ConcurrentLazyList::<u32, u32, _>::with_hash_factory(build);
         assert!(list.len() == 0);
         list.insert(0, 1);
         assert!(list.len() == 1);
@@ -408,7 +442,7 @@ mod tests {
     #[test]
     fn concurrent() {
         let build = BuildHasherDefault::<DefaultHasher>::default();
-        let list = SortedLazyList::<u32, u32, _>::with_hash_factory(build);
+        let list = ConcurrentLazyList::<u32, u32, _>::with_hash_factory(build);
 
         // general test of concurrent operations
         let b = Barrier::new(NUM_THREADS);
@@ -488,12 +522,12 @@ mod tests {
 
     }
 
-    const BENCH_ITERS: usize = 1000;
+    const BENCH_ITERS: usize = 2000;
 
     #[bench]
     fn bench_insert_st(b: &mut Bencher) {
         let build = BuildHasherDefault::<DefaultHasher>::default();
-        let list = SortedLazyList::<u32, u32, _>::with_hash_factory(build);
+        let list = ConcurrentLazyList::<u32, u32, _>::with_hash_factory(build);
 
         b.iter(move || {
             for i in 0..BENCH_ITERS {
@@ -505,7 +539,7 @@ mod tests {
     #[bench]
     fn bench_insert_mt(b: &mut Bencher) {
         let build = BuildHasherDefault::<DefaultHasher>::default();
-        let list = SortedLazyList::<u32, u32, _>::with_hash_factory(build);
+        let list = ConcurrentLazyList::<u32, u32, _>::with_hash_factory(build);
         let mut handles = Vec::new();
 
         let count = AtomicUsize::new(NUM_THREADS);
