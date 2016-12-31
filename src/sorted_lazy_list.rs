@@ -116,7 +116,7 @@ impl<K, V> ConcurrentLazyListAccessor<K, V> {
                     panic!();
                 }
             },
-            Err(arc) => Err( ConcurrentLazyListAccessor { acc: arc, } ),
+            Err(arc) => Err(ConcurrentLazyListAccessor { acc: arc, } ),
         }
     }
 }
@@ -263,7 +263,7 @@ impl<K, V, S> ConcurrentLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
     /// Inserts a key-value pair into the list. Fails if a node with the given key already exists.
     /// Returns whether the insert was successful.
     pub fn insert(&self, key: K, val: V) -> bool {
-        let new = Arc::new( Node::Data {
+        let new = Arc::new(Node::Data {
             hash: self.hash(&key),
             key: key,
             val: val,
@@ -301,7 +301,7 @@ impl<K, V, S> ConcurrentLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
             else if curr.hash() == hash
             && curr.key() == key
             && !curr.next().is_marked() {
-                return Some( ConcurrentLazyListAccessor {
+                return Some(ConcurrentLazyListAccessor {
                     acc: curr,
                 } );
             }
@@ -325,12 +325,14 @@ impl<K, V, S> ConcurrentLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
                 pr = acc.curr_or_next.next().get();
             }
 
-            // we immediately try to physically remove the node. if we fail, the node will
-            // have to be removed later
-            acc.pred.next().compare_exchange(acc.curr_or_next.clone(), pr.0, false, false);
-
             if i_marked_it {
-                Some( ConcurrentLazyListAccessor { acc: acc.curr_or_next, } )
+                // we immediately try to physically remove the node. if we fail, the node will
+                // have to be removed later
+                acc.pred.next().compare_exchange(acc.curr_or_next.clone(), pr.0, false, false);
+
+                Some(ConcurrentLazyListAccessor {
+                    acc: acc.curr_or_next,
+                } )
             }
             else {
                 None
@@ -508,10 +510,9 @@ mod tests {
                 } );
             }
         } );
-
     }
 
-    const BENCH_ITERS: usize = 2000;
+    const BENCH_ITERS: usize = 4000;
 
     #[bench]
     fn bench_insert_st(b: &mut Bencher) {
