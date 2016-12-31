@@ -1,4 +1,4 @@
-#![feature(alloc, heap_api, associated_consts, dropck_parametricity, box_syntax, rand, test)]
+#![feature(alloc, heap_api, associated_consts, dropck_parametricity, box_syntax, test, inclusive_range_syntax)]
 extern crate alloc;
 extern crate rand;
 extern crate crossbeam;

@@ -8,3 +8,4 @@ crossbeam = { git = "https://github.com/Vtec234/crossbeam", branch = "lazy-list-
 #crossbeam = { path = "../crossbeam" }
 
 init_with = "1.0.0"
+rand = "0.3"
