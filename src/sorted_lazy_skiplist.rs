@@ -179,7 +179,7 @@ impl<K, V, S> ConcurrentLazySkiplist<K, V, S> where K: Eq + Hash, S: BuildHasher
     fn random_level(&self) -> usize {
         // thanks to http://ticki.github.io/blog/skip-lists-done-right/
         // TODO think about what rng to use, thread-local or not, etc
-        let r: u64 = rand::random::<u64>() & (1 << HEIGHT - 1);
+        let r: u64 = rand::random::<u64>() & ((1 << HEIGHT) - 1);
         for i in 0..HEIGHT {
             if (r >> i) & 1 == 1 {
                 return i;
