@@ -4,10 +4,12 @@ use std::ops::Deref;
 
 use crossbeam::sync::MarkableArcCell;
 
-
 /// This is a concurrent lock-free singly linked list. Internally, its nodes are sorted by the key's hash.
 /// It provides wait-freedom guarantees on some of its methods.
 /// Most operations on this structure are O(n).
+///
+/// The documentation on this structure might be outdated or incorrect.
+// TODO update docs
 #[derive(Debug)]
 // TODO explicit Send and Sync. right now it's implicitly (i think) as Send and Sync as K and V
 pub struct ConcurrentLazyList<K, V, S> {
@@ -128,8 +130,7 @@ impl<K, V, S> ConcurrentLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
 
     /// If a node with the given key was found, returns `Ok` containing that node and the node
     /// before it. If a node with the given key was not found, returns `Err` with the first node
-    /// whose hash is larger than the given key's hash and the node before it. The first node whose
-    /// hash is larger than the given key's hash might be the end sentinel, which is `Arc::new(None)`.
+    /// whose hash is larger than the given key's hash and the node before it.
     /// The node before it may not have the same key as the given key but may have the same hash.
     /// This method also physically removes the nodes which were marked as logically removed from
     /// the list.
@@ -195,9 +196,9 @@ impl<K, V, S> ConcurrentLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
         } // loop
     } // fn
 
-    /// Forces physical removal of all logically removed nodes. Useful if the user wants to
-    /// retrieve the raw key and value from a node accessor, but the node is still owned by
-    /// the list.
+    /// Tries to physically remove as many logically removed nodes as possible. Useful if the user
+    /// wants to retrieve the raw key and value from a node accessor, but the node is still
+    /// owned by the list.
     pub fn cleanup(&self) {
         'begin_from_head: loop {
             // predecessor. initial value is Node::Head

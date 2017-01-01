@@ -5,8 +5,17 @@ use std::ops::Deref;
 use rand;
 
 
+/// This is a concurrent lock-free map.
+/// It provides wait-freedom guarantees on some of its methods.
+/// The average time complexity for operations on this structure is O(log n).
+///
+/// It is implemented as a skiplist. It uses reference counting to reclaim memory
+/// lazily - this means that calling `remove()` removes a node logically only,
+/// and it still has to be removed physically later.
+/// Internally, the nodes are sorted by the key's hash.
+/// The name stands for Lazy Reference Counted Skiplist Map.
 #[derive(Debug)]
-pub struct ConcurrentLazySkiplist<K, V, S> {
+pub struct LRCSkiplistMap<K, V, S> {
     head: Arc<Node<K, V>>,
     hasher_factory: S,
     //rng: R,
@@ -19,11 +28,13 @@ const TOP_LEVEL: usize = HEIGHT - 1;
 
 #[derive(Debug)]
 enum Node<K, V> {
+    /// The head of the list is its first node. It always exists and contains no data.
     Head {
         /// All references in `Head` must be some, the type is only an `Option` for convenience,
         /// since then it's the same as in `Data`.
         nexts: [Option<MarkableArcCell<Node<K, V>>>; HEIGHT],
     },
+    /// A single node in the linked list, containg a key and a value.
     Data {
         hash: u64,
         key: K,
@@ -40,6 +51,7 @@ enum Node<K, V> {
         nexts: [Option<MarkableArcCell<Node<K, V>>>; HEIGHT],
         top_level: usize,
     },
+    /// The tail is the list's last node.
     Tail,
 }
 
@@ -84,18 +96,21 @@ impl<K, V> Node<K, V> {
     }
 }
 
+/// A list of pairs of (hopefully :]) consecutive nodes for internal access
+/// for each level.
 #[derive(Debug)]
 struct NodeAccesses<K, V> {
     preds: [Arc<Node<K, V>>; HEIGHT],
     currs_or_nexts: [Arc<Node<K, V>>; HEIGHT],
 }
 
+/// Provides access to a node in the list.
 #[derive(Debug)]
-pub struct ConcurrentLazySkiplistAccessor<K, V> {
+pub struct LRCSkiplistMapAccessor<K, V> {
     acc: Arc<Node<K, V>>,
 }
 
-impl<K, V> ConcurrentLazySkiplistAccessor<K, V> {
+impl<K, V> LRCSkiplistMapAccessor<K, V> {
     /// Unwraps the raw key and value from the accessor. This method only has a chance to work
     /// on a recently removed node. That is, when the accessor is returned from `remove()`
     /// and the node is physically removed later (either lazily or using `cleanup()`).
@@ -111,12 +126,12 @@ impl<K, V> ConcurrentLazySkiplistAccessor<K, V> {
                     panic!("1");
                 }
             },
-            Err(arc) => Err(ConcurrentLazySkiplistAccessor { acc: arc, } ),
+            Err(arc) => Err(LRCSkiplistMapAccessor { acc: arc, } ),
         }
     }
 }
 
-impl<K, V> Deref for ConcurrentLazySkiplistAccessor<K, V> {
+impl<K, V> Deref for LRCSkiplistMapAccessor<K, V> {
     type Target = V;
 
     fn deref(&self) -> &V {
@@ -129,7 +144,7 @@ impl<K, V> Deref for ConcurrentLazySkiplistAccessor<K, V> {
     }
 }
 
-impl<K, V, S> Drop for ConcurrentLazySkiplist<K, V, S> {
+impl<K, V, S> Drop for LRCSkiplistMap<K, V, S> {
     fn drop(&mut self) {
         // TODO mitigate stack overflow for large lists. currently only mitigated for large-ish lists
         // drop by parts - iterate to 2/3 -> drop, iterate to 1/3 -> drop, etc.
@@ -148,12 +163,14 @@ impl<K, V, S> Drop for ConcurrentLazySkiplist<K, V, S> {
     }
 }
 
-impl<K, V, S> ConcurrentLazySkiplist<K, V, S> where K: Eq + Hash, S: BuildHasher {
+impl<K, V, S> LRCSkiplistMap<K, V, S> where K: Eq + Hash, S: BuildHasher {
+    /// Builds a new instance of the map, which will use the provided
+    /// hasher factory to hash keys.
     pub fn with_hash_factory(f: S) -> Self {
         use init_with::InitWith;
 
         let tail = Arc::new(Node::Tail);
-        ConcurrentLazySkiplist {
+        LRCSkiplistMap {
             head: Arc::new(
                 Node::Head {
                     nexts: <[Option<MarkableArcCell<Node<K, V>>>; HEIGHT]>::init_with(|| {
@@ -188,6 +205,12 @@ impl<K, V, S> ConcurrentLazySkiplist<K, V, S> where K: Eq + Hash, S: BuildHasher
         return HEIGHT - 1;
     }
 
+    /// If a node with the given key was found, returns `Ok` containing its predecessor and either
+    /// itself or its successor at each level. If a node with the given key was not found, returns
+    /// `Err` containing the first node whose hash is larger than the given key's hash its predecessor
+    /// at each level. The node before it may not have the same key as the given key, but may have
+    /// the same hash. This method also physically removes the marked nodes which it encounters from
+    /// the list.
     fn find_pairs(&self, key: &K) -> Result<NodeAccesses<K, V>, NodeAccesses<K, V>> {
         use init_with::InitWith;
 
@@ -257,6 +280,9 @@ impl<K, V, S> ConcurrentLazySkiplist<K, V, S> where K: Eq + Hash, S: BuildHasher
         } // loop
     } // fn
 
+    /// Tries to physically remove as many logically removed nodes as possible. Useful if the user
+    /// wants to retrieve the raw key and value from a node accessor, but the node is still
+    /// owned by the map.
     pub fn cleanup(&self) {
         for lvl in 0...TOP_LEVEL {
             'begin_from_head: loop {
@@ -291,6 +317,8 @@ impl<K, V, S> ConcurrentLazySkiplist<K, V, S> where K: Eq + Hash, S: BuildHasher
         }
     }
 
+    /// Inserts a key-value pair into the map. Fails if a node with the given key already exists.
+    /// Returns whether the insert was successful.
     pub fn insert(&self, key: K, val: V) -> bool {
         use init_with::InitWith;
 
@@ -358,7 +386,9 @@ impl<K, V, S> ConcurrentLazySkiplist<K, V, S> where K: Eq + Hash, S: BuildHasher
         }
     }
 
-    pub fn find(&self, key: &K) -> Option<ConcurrentLazySkiplistAccessor<K, V>> {
+    /// If a node with the given key is found, returns an access to it, otherwise returns `None`.
+    /// This method is wait-free.
+    pub fn find(&self, key: &K) -> Option<LRCSkiplistMapAccessor<K, V>> {
         let hash = self.hash(key);
         let mut pred = self.head.clone();
         let mut curr = pred.nexts()[TOP_LEVEL].as_ref().unwrap().get_arc();
@@ -385,7 +415,7 @@ impl<K, V, S> ConcurrentLazySkiplist<K, V, S> where K: Eq + Hash, S: BuildHasher
         } // for
 
         if curr.is_data() && curr.key() == key {
-            return Some(ConcurrentLazySkiplistAccessor {
+            return Some(LRCSkiplistMapAccessor {
                 acc: curr,
             } );
         }
@@ -394,7 +424,9 @@ impl<K, V, S> ConcurrentLazySkiplist<K, V, S> where K: Eq + Hash, S: BuildHasher
         }
     } // fn
 
-    pub fn remove(&self, key: &K) -> Option<ConcurrentLazySkiplistAccessor<K, V>> {
+    /// If a node with the given key is found, logically removes it from the map and returns an
+    /// access to that node. Otherwise returns `None`.
+    pub fn remove(&self, key: &K) -> Option<LRCSkiplistMapAccessor<K, V>> {
         self.find_pairs(key).ok().and_then(|acc| {
             let node_to_remove = acc.currs_or_nexts[0].clone();
             for lvl in (1...node_to_remove.top_level()).rev() {
@@ -429,7 +461,7 @@ impl<K, V, S> ConcurrentLazySkiplist<K, V, S> where K: Eq + Hash, S: BuildHasher
                     );
                 }
 
-                Some(ConcurrentLazySkiplistAccessor {
+                Some(LRCSkiplistMapAccessor {
                     acc: node_to_remove,
                 } )
             }
@@ -439,12 +471,17 @@ impl<K, V, S> ConcurrentLazySkiplist<K, V, S> where K: Eq + Hash, S: BuildHasher
         } )
     } // fn
 
+    /// Checks whether a node with the given key is currently present in the map.
+    /// This method is wait-free.
     pub fn contains(&self, key: &K) -> bool {
         self.find(key).is_some()
     }
 }
 
-impl<K, V, S> ConcurrentLazySkiplist<K, V, S> {
+// relaxed requirements in this `impl` allow us to use `len()` in `drop()`
+impl<K, V, S> LRCSkiplistMap<K, V, S> {
+    /// Returns the number of elements currently in the map, as observed by the thread.
+    /// This method is wait-free.
     pub fn len(&self) -> usize {
         let mut curr = self.head.nexts()[0].as_ref().unwrap().get_arc();
 
@@ -476,7 +513,7 @@ mod tests {
     #[test]
     fn basic_insert() {
         let build = BuildHasherDefault::<DefaultHasher>::default();
-        let list = ConcurrentLazySkiplist::<u32, u32, _>::with_hash_factory(build);
+        let list = LRCSkiplistMap::<u32, u32, _>::with_hash_factory(build);
         let inserted = list.insert(0, 1);
         assert!(inserted);
         assert!(list.find(&0).is_some());
@@ -487,7 +524,7 @@ mod tests {
     #[test]
     fn basic_remove() {
         let build = BuildHasherDefault::<DefaultHasher>::default();
-        let list = ConcurrentLazySkiplist::<u32, u32, _>::with_hash_factory(build);
+        let list = LRCSkiplistMap::<u32, u32, _>::with_hash_factory(build);
         list.insert(0, 1);
 
         let removed = list.remove(&0);
@@ -509,7 +546,7 @@ mod tests {
     #[test]
     fn basic_len() {
         let build = BuildHasherDefault::<DefaultHasher>::default();
-        let list = ConcurrentLazySkiplist::<u32, u32, _>::with_hash_factory(build);
+        let list = LRCSkiplistMap::<u32, u32, _>::with_hash_factory(build);
         assert!(list.len() == 0);
         list.insert(0, 1);
         assert!(list.len() == 1);
@@ -527,7 +564,7 @@ mod tests {
     #[test]
     fn concurrent() {
         let build = BuildHasherDefault::<DefaultHasher>::default();
-        let list = ConcurrentLazySkiplist::<u32, u32, _>::with_hash_factory(build);
+        let list = LRCSkiplistMap::<u32, u32, _>::with_hash_factory(build);
 
         // general test of concurrent operations
         let b = Barrier::new(NUM_THREADS);
@@ -611,7 +648,7 @@ mod tests {
     #[bench]
     fn bench_insert_st(b: &mut Bencher) {
         let build = BuildHasherDefault::<DefaultHasher>::default();
-        let list = ConcurrentLazySkiplist::<u32, u32, _>::with_hash_factory(build);
+        let list = LRCSkiplistMap::<u32, u32, _>::with_hash_factory(build);
 
         b.iter(move || {
             for i in 0..BENCH_ITERS {
@@ -623,7 +660,7 @@ mod tests {
     #[bench]
     fn bench_insert_mt(b: &mut Bencher) {
         let build = BuildHasherDefault::<DefaultHasher>::default();
-        let list = ConcurrentLazySkiplist::<u32, u32, _>::with_hash_factory(build);
+        let list = LRCSkiplistMap::<u32, u32, _>::with_hash_factory(build);
         let mut handles = Vec::new();
 
         let count = AtomicUsize::new(NUM_THREADS);
