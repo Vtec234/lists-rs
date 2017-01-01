@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use std::hash::{Hash, Hasher, BuildHasher};
 use std::ops::Deref;
-use std::cmp;
 
 use crossbeam::sync::MarkableArcCell;
+
 
 /// This is a concurrent lock-free singly linked list. Internally, its nodes are sorted by the key's hash.
 /// It provides wait-freedom guarantees on some of its methods.
@@ -63,28 +63,6 @@ impl<K, V> Node<K, V> {
         use self::Node::*;
 
         if let &Data { hash, .. } = self { hash } else { panic!() }
-    }
-}
-
-impl<K, V> cmp::PartialEq<u64> for Node<K, V> {
-    fn eq(&self, other: &u64) -> bool {
-        if let Node::Data { hash, .. } = *self {
-            hash.eq(other)
-        }
-        else {
-            false
-        }
-    }
-}
-
-impl<K, V> cmp::PartialOrd<u64> for Node<K, V> {
-    fn partial_cmp(&self, other: &u64) -> Option<cmp::Ordering> {
-        use self::Node::*;
-        match *self {
-            Head { .. } => Some(cmp::Ordering::Less),
-            Data { hash, .. } => hash.partial_cmp(other),
-            Tail => Some(cmp::Ordering::Greater),
-        }
     }
 }
 

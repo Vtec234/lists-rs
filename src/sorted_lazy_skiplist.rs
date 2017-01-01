@@ -4,9 +4,7 @@ use crossbeam::sync::MarkableArcCell;
 use std::ops::Deref;
 use rand;
 
-// 2 | 2 -- - -- - -- 4 -- - -- 9
-// 1 | 2 -- - -- 3 -- 4 -- 5 -- 9
-// 0 | 2 -- 2 -- 3 -- 4 -- 5 -- 9
+
 #[derive(Debug)]
 pub struct ConcurrentLazySkiplist<K, V, S> {
     head: Arc<Node<K, V>>,
@@ -14,101 +12,39 @@ pub struct ConcurrentLazySkiplist<K, V, S> {
     //rng: R,
 }
 
-
-#[derive(Debug)]
-struct NodeAccesses<K, V> {
-    preds: [Arc<Node<K, V>>; HEIGHT],
-    currs_or_nexts: [Arc<Node<K, V>>; HEIGHT],
-}
+// the expected number of levels is log_(1/PROB)(n) for n nodes
+// 16 levels is enough for 65536 nodes with PROB = 1/2
+const HEIGHT: usize = 16;
+const TOP_LEVEL: usize = HEIGHT - 1;
 
 #[derive(Debug)]
 enum Node<K, V> {
     Head {
+        /// All references in `Head` must be some, the type is only an `Option` for convenience,
+        /// since then it's the same as in `Data`.
         nexts: [Option<MarkableArcCell<Node<K, V>>>; HEIGHT],
     },
     Data {
         hash: u64,
         key: K,
         val: V,
-        // A list of pointers to the next node for each skiplist level.
-        // A marker value of true indicates that this node has been logically deleted
-        // on the given level.
-        //next: SomeSortOfListOrArray<MarkableArcCell<Option<Node<K, V>>>>,
-        // base_list: MarkableArcCell<Option<Node<K, V>>>
-        // other_lists: [MarkableArcCell<Option<Node<K, V>>>; STATIC_NUM] or List<MarkableArcCell<Option<Node<K, V>>>> <- DYNAMIC_NUM ??
-        // OR
-        // just [.. ; STATIC_NUM + 1] vs List<..> <- DYNAMIC_NUM + 1 (including base list)
+
+        /// An array of references to the next node in the skiplist for each list level.
+        /// References must be `Some` up to and including `top_level` and `None` above.
+        /// A marker value of `true` indicates that this node has been logically deleted
+        /// on the given level.
+        /// A node is logically in the skiplist iff it is present and unmarked in the bottom level,
+        /// other levels are only a convenience and do not matter to the user.
+        // This is a statically sized array to avoid dynamic allocation and associated conurrency
+        // problems. Of course, this means each node takes up more space than is strictly necessary.
         nexts: [Option<MarkableArcCell<Node<K, V>>>; HEIGHT],
-        // the highest level which contains a valid reference, i.e. `nexts[top_level].is_some()`
         top_level: usize,
     },
     Tail,
 }
 
-#[derive(Debug)]
-pub struct ConcurrentLazySkiplistAccessor<K, V> {
-    acc: Arc<Node<K, V>>,
-}
-
-impl<K, V> ConcurrentLazySkiplistAccessor<K, V> {
-    /// This method only has a chance to work on a recently removed node. That is, in the case when it
-    /// is returned from `remove()`` and physically removed later (either lazily or using `cleanup()`).
-    /// Even then, it might still be co-owned by another thread. It returns the key and value
-    /// if it succeeds, the same accessor otherwise.
-    // TODO make this take Self instead like Arc so that deref works for val.try_unwrap()?
-    pub fn try_unwrap(self) -> Result<(K, V), Self> {
-        match Arc::try_unwrap(self.acc) {
-            Ok(node) => {
-                if let Node::Data { key, val, .. } = node {
-                    Ok((key, val))
-                }
-                else {
-                    panic!("1");
-                }
-            },
-            Err(arc) => Err(ConcurrentLazySkiplistAccessor { acc: arc, } ),
-        }
-    }
-}
-
-impl<K, V> Deref for ConcurrentLazySkiplistAccessor<K, V> {
-    type Target = V;
-
-    fn deref(&self) -> &V {
-        if let Node::Data { ref val, .. } = *self.acc {
-            val
-        }
-        else {
-            panic!("2");
-        }
-    }
-}
-
-impl<K, V, S> Drop for ConcurrentLazySkiplist<K, V, S> {
-    fn drop(&mut self) {
-        // TODO mitigate SO for large lists. currently only mitigated for large-ish lists
-        // drop by parts - iterate to 2/3 -> drop, iterate to 1/3 -> drop, etc.
-        // part count depends on stack size and list len
-        let len = self.len();
-        const MAX_STACK: usize = 2000;
-        if len > MAX_STACK {
-            let mut curr = self.head.clone();
-            for _ in 0..len/2 {
-                curr = curr.nexts()[0].as_ref().unwrap().get_arc();
-            }
-            for lvl in 0...curr.top_level() {
-                curr.nexts()[lvl].as_ref().unwrap().set(Arc::new(Node::Tail), false);
-            }
-        }
-    }
-}
-
-// the expected number of levels is log_(1/PROB)(n) for n nodes
-// 16 levels is enough for 65536 nodes with PROB = 1/2
-const HEIGHT: usize = 16;
-const TOP_LEVEL: usize = HEIGHT - 1;
-
 impl<K, V> Node<K, V> {
+    // TODO remove pattern matching when unnecessary for release builds
     fn nexts(&self) -> &[Option<MarkableArcCell<Node<K, V>>>; HEIGHT] {
         use self::Node::*;
 
@@ -148,6 +84,70 @@ impl<K, V> Node<K, V> {
     }
 }
 
+#[derive(Debug)]
+struct NodeAccesses<K, V> {
+    preds: [Arc<Node<K, V>>; HEIGHT],
+    currs_or_nexts: [Arc<Node<K, V>>; HEIGHT],
+}
+
+#[derive(Debug)]
+pub struct ConcurrentLazySkiplistAccessor<K, V> {
+    acc: Arc<Node<K, V>>,
+}
+
+impl<K, V> ConcurrentLazySkiplistAccessor<K, V> {
+    /// Unwraps the raw key and value from the accessor. This method only has a chance to work
+    /// on a recently removed node. That is, when the accessor is returned from `remove()`
+    /// and the node is physically removed later (either lazily or using `cleanup()`).
+    /// Even then, it might still be co-owned by another thread. It returns the values
+    /// if it succeeds, the same accessor otherwise.
+    pub fn try_unwrap(self) -> Result<(K, V), Self> {
+        match Arc::try_unwrap(self.acc) {
+            Ok(node) => {
+                if let Node::Data { key, val, .. } = node {
+                    Ok((key, val))
+                }
+                else {
+                    panic!("1");
+                }
+            },
+            Err(arc) => Err(ConcurrentLazySkiplistAccessor { acc: arc, } ),
+        }
+    }
+}
+
+impl<K, V> Deref for ConcurrentLazySkiplistAccessor<K, V> {
+    type Target = V;
+
+    fn deref(&self) -> &V {
+        if let Node::Data { ref val, .. } = *self.acc {
+            val
+        }
+        else {
+            panic!("2");
+        }
+    }
+}
+
+impl<K, V, S> Drop for ConcurrentLazySkiplist<K, V, S> {
+    fn drop(&mut self) {
+        // TODO mitigate stack overflow for large lists. currently only mitigated for large-ish lists
+        // drop by parts - iterate to 2/3 -> drop, iterate to 1/3 -> drop, etc.
+        // part count depends on stack size and list len
+        let len = self.len();
+        const MAX_STACK: usize = 2000;
+        if len > MAX_STACK {
+            let mut curr = self.head.clone();
+            for _ in 0..len/2 {
+                curr = curr.nexts()[0].as_ref().unwrap().get_arc();
+            }
+            for lvl in 0...curr.top_level() {
+                curr.nexts()[lvl].as_ref().unwrap().set(Arc::new(Node::Tail), false);
+            }
+        }
+    }
+}
+
 impl<K, V, S> ConcurrentLazySkiplist<K, V, S> where K: Eq + Hash, S: BuildHasher {
     pub fn with_hash_factory(f: S) -> Self {
         use init_with::InitWith;
@@ -175,9 +175,9 @@ impl<K, V, S> ConcurrentLazySkiplist<K, V, S> where K: Eq + Hash, S: BuildHasher
 
     /// Returns a randomly chosen level in range [0;HEIGHT), where the probability
     /// of choosing level L is PROB^(L+1).
+    // PROB is currently hardwired to 1/2
     fn random_level(&self) -> usize {
         // thanks to http://ticki.github.io/blog/skip-lists-done-right/
-        // only works for PROB = 1/2
         // TODO think about what rng to use, thread-local or not, etc
         let r: u64 = rand::random::<u64>() & (1 << HEIGHT - 1);
         for i in 0..HEIGHT {
@@ -292,7 +292,6 @@ impl<K, V, S> ConcurrentLazySkiplist<K, V, S> where K: Eq + Hash, S: BuildHasher
     }
 
     pub fn insert(&self, key: K, val: V) -> bool {
-        // TODO method is probably most likely definitely wrong. fix it
         use init_with::InitWith;
 
         let top_level = self.random_level();
@@ -347,7 +346,7 @@ impl<K, V, S> ConcurrentLazySkiplist<K, V, S> where K: Eq + Hash, S: BuildHasher
                             // if inserting at given level failed we have to redo search
                             acc = match self.find_pairs(new.key()) {
                                 Ok(acc) => acc,
-                                // TODO can we abandon inserting as an optimization if find returns Err?
+                                // TODO can we abandon inserting as an optimization if find returns Err here?
                                 Err(acc) => acc,
                             };
                         }
