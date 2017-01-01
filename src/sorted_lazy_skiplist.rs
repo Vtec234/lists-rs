@@ -84,6 +84,25 @@ impl<K, V> Deref for ConcurrentLazySkiplistAccessor<K, V> {
     }
 }
 
+impl<K, V, S> Drop for ConcurrentLazySkiplist<K, V, S> {
+    fn drop(&mut self) {
+        // TODO mitigate SO for large lists. currently only mitigated for large-ish lists
+        // drop by parts - iterate to 2/3 -> drop, iterate to 1/3 -> drop, etc.
+        // part count depends on stack size and list len
+        let len = self.len();
+        const MAX_STACK: usize = 2000;
+        if len > MAX_STACK {
+            let mut curr = self.head.clone();
+            for _ in 0..len/2 {
+                curr = curr.nexts()[0].as_ref().unwrap().get_arc();
+            }
+            for lvl in 0...curr.top_level() {
+                curr.nexts()[lvl].as_ref().unwrap().set(Arc::new(Node::Tail), false);
+            }
+        }
+    }
+}
+
 // the expected number of levels is log_(1/PROB)(n) for n nodes
 // 16 levels is enough for 65536 nodes with PROB = 1/2
 const HEIGHT: usize = 16;
@@ -424,7 +443,9 @@ impl<K, V, S> ConcurrentLazySkiplist<K, V, S> where K: Eq + Hash, S: BuildHasher
     pub fn contains(&self, key: &K) -> bool {
         self.find(key).is_some()
     }
+}
 
+impl<K, V, S> ConcurrentLazySkiplist<K, V, S> {
     pub fn len(&self) -> usize {
         let mut curr = self.head.nexts()[0].as_ref().unwrap().get_arc();
 
