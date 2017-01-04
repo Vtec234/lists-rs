@@ -9,7 +9,9 @@ extern crate init_with;
 mod things_array;
 mod sorted_lazy_list;
 mod sorted_lazy_skiplist;
+mod epoch_skiplist;
 
 pub use things_array::*;
 pub use sorted_lazy_list::*;
 pub use sorted_lazy_skiplist::*;
+pub use epoch_skiplist::*;

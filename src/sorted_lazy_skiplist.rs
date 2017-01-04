@@ -366,7 +366,16 @@ impl<K, V, S> LRCSkiplistMap<K, V, S> where K: Eq + Hash, S: BuildHasher {
                     }
 
                     for lvl in 1...top_level {
+                        use std::mem;
                         loop {
+                            unsafe {
+                                let pred_next = mem::transmute::<_, usize>(acc.currs_or_nexts[lvl].clone());
+                                if pred_next != mem::transmute::<_, usize>(new.nexts()[lvl].as_ref().unwrap().clone())
+                                && pred_next != mem::transmute::<_, usize>(new.clone()) {
+                                    println!("BUGBUGBUG");
+                                }
+                            }
+                            // our next might be stale, we have t cas-check for new.nexts[lvl] instead
                             if acc.preds[lvl].nexts()[lvl].as_ref().unwrap().compare_exchange(acc.currs_or_nexts[lvl].clone(), new.clone(), false, false) {
                                 break;
                             }
@@ -431,6 +440,7 @@ impl<K, V, S> LRCSkiplistMap<K, V, S> where K: Eq + Hash, S: BuildHasher {
             let node_to_remove = acc.currs_or_nexts[0].clone();
             for lvl in (1...node_to_remove.top_level()).rev() {
                 while !node_to_remove.nexts()[lvl].as_ref().unwrap().is_marked() {
+                    // is this wrong? what if it's still being inserted?
                     node_to_remove.nexts()[lvl].as_ref().unwrap().compare_arc_exchange_mark(
                         node_to_remove.nexts()[lvl].as_ref().unwrap().get_arc(),
                         true
