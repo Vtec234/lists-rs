@@ -135,20 +135,14 @@ impl<K, V, S> EpochSkiplistMap<K, V, S> where K: Eq + Hash, S: BuildHasher {
     }
 
     fn find_pairs<'a>(&self, key: &K, g: &'a Guard) -> Result<NodePosition<'a, K, V>, NodePosition<'a, K, V>> {
-        use init_with::InitWith;
-
         let hash = self.hash(key);
 
         // "The Position" refers to the position where a node with the given key should be or is.
         // This list points to nodes before the Position at every level.
-        // TODO this shouldn't be Option, it's annoying. Do ptr::write? We can probably count on Shared's destructor not to do anything wierd with junk memory.
-        let mut preds = <[Option<Shared<Node<K, V>>>; HEIGHT]>::init_with(|| {
-            None
-        } );
+        // TODO what about panics? might be UB, although OTOH panics here are UB anyway
+        let mut preds: [Shared<Node<K, V>>; HEIGHT] = unsafe { mem::uninitialized() };
         // This list at every level points to nodes either after the Position or at the Position if a node with the given key exists.
-        let mut currs = <[Option<Shared<Node<K, V>>>; HEIGHT]>::init_with(|| {
-            None
-        } );
+        let mut currs: [Shared<Node<K, V>>; HEIGHT] = unsafe { mem::uninitialized() };
 
         // We execute the standard skiplist search algorithm by moving right and descending levels when the next node comes after the Position.
         'begin_from_head: loop {
@@ -204,39 +198,24 @@ impl<K, V, S> EpochSkiplistMap<K, V, S> where K: Eq + Hash, S: BuildHasher {
                     continue 'begin_from_head;
                 }
 
-                preds[lvl] = Some(pred);
-                currs[lvl] = Some(curr);
+                unsafe {
+                    ptr::write(&mut preds[lvl] as *mut _, pred);
+                    ptr::write(&mut currs[lvl] as *mut _, curr);
+                }
             }
 
-            // TODO make this less hacky by setting the same type, see definitions above.
-            let mut i = 0;
-            let mut j = 0;
-            if currs[0].unwrap().is_data() && currs[0].unwrap().key() == key {
+            if currs[0].is_data() && currs[0].key() == key {
                 return Ok(NodePosition {
-                    preds: <[Shared<Node<K, V>>; HEIGHT]>::init_with(|| {
-                        let k = i;
-                        i = i + 1;
-                        preds[k].unwrap()
-                    } ),
-                    currs_or_nexts: <[Shared<Node<K, V>>; HEIGHT]>::init_with(|| {
-                        let k = j;
-                        j = j + 1;
-                        currs[k].unwrap()
-                    } ),
+                    preds: preds,
+                    // currs
+                    currs_or_nexts: currs,
                 } );
             }
             else {
                 return Err(NodePosition {
-                    preds: <[Shared<Node<K, V>>; HEIGHT]>::init_with(|| {
-                        let k = i;
-                        i = i + 1;
-                        preds[k].unwrap()
-                    } ),
-                    currs_or_nexts: <[Shared<Node<K, V>>; HEIGHT]>::init_with(|| {
-                        let k = j;
-                        j = j + 1;
-                        currs[k].unwrap()
-                    } ),
+                    preds: preds,
+                    // nexts
+                    currs_or_nexts: currs,
                 } );
             }
         }
