@@ -91,7 +91,6 @@ struct NodePosition<'a, K: 'a, V: 'a> {
     currs_or_nexts: [Shared<'a, Node<K, V>>; HEIGHT],
 }
 
-use std::fmt;
 impl<K, V, S> EpochSkiplistMap<K, V, S> where K: Eq + Hash, S: BuildHasher {
     pub fn with_hash_factory(f: S) -> Self {
         use init_with::InitWith;
@@ -401,26 +400,20 @@ mod tests {
     use std::hash::BuildHasherDefault;
     use std::collections::hash_map::DefaultHasher;
 
+    use std::sync::Barrier;
+
+    use crossbeam;
+
     use super::*;
 
     fn with_def_hasher<K, V>() -> EpochSkiplistMap<K, V, BuildHasherDefault<DefaultHasher>> where K: Eq + Hash {
         let build = BuildHasherDefault::<DefaultHasher>::default();
         EpochSkiplistMap::with_hash_factory(build)
     }
-    #[test]
-    fn st_insert_1() {
-        let map: EpochSkiplistMap<u32, u32, _> = with_def_hasher();
-        let inserted = map.insert(0, 1);
-        assert!(inserted);
-        assert!(map.contains(&0));
-        assert!(map.find(&0) == Some(1));
-        assert!(!map.contains(&1));
-    }
 
-    #[test]
-    fn st_insert_10() {
-        let map: EpochSkiplistMap<u32, u32, _> = with_def_hasher();
-        for i in 0..10 {
+    fn st_insert_k(k_loops: usize) {
+        let map: EpochSkiplistMap<usize, usize, _> = with_def_hasher();
+        for i in 0..k_loops {
             let inserted = map.insert(i, i+1);
             assert!(inserted);
             assert!(map.contains(&i));
@@ -430,25 +423,18 @@ mod tests {
     }
 
     #[test]
-    fn st_remove_1() {
-        let map: EpochSkiplistMap<u32, u32, _> = with_def_hasher();
-        map.insert(0, 1);
-        let removed = map.remove(&0);
-        assert!(removed.is_some());
-        assert!(removed.unwrap() == 1);
-        assert!(!map.contains(&0));
-        let removed_twice = map.remove(&0);
-        assert!(removed_twice.is_none());
+    fn st_insert() {
+        st_insert_k(1);
+        st_insert_k(10);
     }
 
-    #[test]
-    fn st_remove_10() {
-        let map: EpochSkiplistMap<u32, u32, _> = with_def_hasher();
-        for i in 0..10 {
+    fn st_remove_k(k_loops: usize) {
+        let map: EpochSkiplistMap<usize, usize, _> = with_def_hasher();
+        for i in 0..k_loops {
             map.insert(i, i+1);
         }
 
-        for i in 0..10 {
+        for i in 0..k_loops {
             let removed = map.remove(&i);
             assert!(removed.is_some());
             assert!(removed.unwrap() == i+1);
@@ -459,11 +445,90 @@ mod tests {
     }
 
     #[test]
+    fn st_remove() {
+        st_remove_k(1);
+        st_remove_k(10);
+    }
+
+    #[test]
     fn st_size() {
-        let map: EpochSkiplistMap<u32, u32, _> = with_def_hasher();
-        for i in 0..10{
-            assert!(map.size() as u32 == i);
+        let map: EpochSkiplistMap<usize, usize, _> = with_def_hasher();
+        for i in 0..10 {
+            assert!(map.size() == i);
             map.insert(i, i+1);
         }
+    }
+
+    struct U32(u32);
+    fn mt_n_test<F: Fn(usize)>(f: F) {
+        f(2);
+        f(4);
+        f(8);
+    }
+
+    fn mt_n_insert_k(n_threads: usize, k_loops: usize) {
+        let map: EpochSkiplistMap<u32, u32, _> = with_def_hasher();
+        let b = Barrier::new(n_threads);
+        crossbeam::scope(|scope| {
+            for i in 0..n_threads {
+                let i = U32(i as u32);
+                scope.spawn(|| {
+                    let i = {i}.0;
+                    b.wait();
+                    for j in 0..k_loops {
+                        let i = (k_loops as u32)*i + j as u32;
+                        let inserted = map.insert(i, i+1);
+                        assert!(inserted);
+                        assert!(map.contains(&i));
+                        assert!(map.find(&i) == Some(i+1));
+                    }
+                } );
+            }
+        } );
+    }
+
+    #[test]
+    fn mt_insert() {
+        mt_n_test(|n| { mt_n_insert_k(n, 1) } );
+        mt_n_test(|n| { mt_n_insert_k(n, 100) } );
+    }
+
+    fn mt_n_remove_k(n_threads: usize, k_loops: usize) {
+        let map: EpochSkiplistMap<u32, u32, _> = with_def_hasher();
+        let b = Barrier::new(n_threads);
+        crossbeam::scope(|scope| {
+            for i in 0..n_threads {
+                let i = U32(i as u32);
+                scope.spawn(|| {
+                    let i = {i}.0;
+                    b.wait();
+                    for j in 0..k_loops {
+                        let i = k_loops as u32*i + j as u32;
+                        map.insert(i, i+1);
+                        let removed = map.remove(&i);
+                        assert!(removed.is_some());
+                        assert!(removed.unwrap() == i+1);
+                        assert!(!map.contains(&i));
+                        let removed_twice = map.remove(&i);
+                        assert!(removed_twice.is_none());
+                    }
+                } );
+            }
+        } );
+    }
+
+    #[test]
+    fn mt_remove() {
+        mt_n_test(|n| { mt_n_remove_k(n, 1) } );
+        mt_n_test(|n| { mt_n_remove_k(n, 100) } );
+    }
+
+    fn mt_n_afl(n_threads: usize) {
+        // TODO
+    }
+
+    #[test]
+    fn mt_afl() {
+        mt_n_test(mt_n_afl);
     }
 }
