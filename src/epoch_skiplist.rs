@@ -1,14 +1,26 @@
 use crossbeam::mem::epoch::*;
 use std::hash::{Hash, BuildHasher};
 use std::sync::atomic::Ordering;
+use std::borrow::Borrow;
 use std::mem;
 use std::ptr;
 
+// TODO make Debug not rely on K: Debug, V: Debug, S: Debug.
 #[derive(Debug)]
 pub struct EpochSkiplistMap<K, V, S> {
     head: Atomic<Node<K, V>>,
     hasher_factory: S,
 }
+
+// TODO i just guessed these.
+unsafe impl<K, V, S> Send for EpochSkiplistMap<K, V, S>
+    where K: Send,
+          V: Send,
+          S: Send {}
+unsafe impl<K, V, S> Sync for EpochSkiplistMap<K, V, S>
+    where K: Send + Sync,
+          V: Send + Sync,
+          S: Sync {}
 
 const HEIGHT: usize = 16;
 const TOP_LEVEL: usize = HEIGHT - 1;
@@ -110,7 +122,11 @@ struct NodePosition<'a, K: 'a, V: 'a> {
     currs_or_nexts: [Shared<'a, Node<K, V>>; HEIGHT],
 }
 
-impl<K, V, S> EpochSkiplistMap<K, V, S> where K: Eq + Hash, S: BuildHasher {
+impl<K, V, S> EpochSkiplistMap<K, V, S>
+    where K: Eq + Hash,
+          S: BuildHasher
+{
+    /// Creates an empty map which will use the given hasher factory to hash keys.
     pub fn with_hash_factory(f: S) -> Self {
         use init_with::InitWith;
 
@@ -127,7 +143,8 @@ impl<K, V, S> EpochSkiplistMap<K, V, S> where K: Eq + Hash, S: BuildHasher {
         }
     }
 
-    fn hash(&self, key: &K) -> u64 {
+    /// Hashes the given key using the hasher factory which this map instance uses.
+    fn hash<Q: ?Sized + Hash>(&self, key: &Q) -> u64 {
         use std::hash::Hasher;
 
         // TODO is this stateless?
@@ -136,29 +153,20 @@ impl<K, V, S> EpochSkiplistMap<K, V, S> where K: Eq + Hash, S: BuildHasher {
         hasher.finish()
     }
 
-    /// Returns a randomly chosen level in range [0;HEIGHT), where the probability
-    /// of choosing level L is PROB^(L+1).
-    // PROB is currently hardwired to 1/2.
-    fn random_level(&self) -> usize {
-        use rand;
-
-        // thanks to http://ticki.github.io/blog/skip-lists-done-right/
-        // TODO think about what rng to use, thread-local or not, etc
-        let r: u64 = rand::random::<u64>() & ((1 << HEIGHT) - 1);
-        for i in 0..HEIGHT {
-            if (r >> i) & 1 == 1 {
-                return i;
-            }
-        }
-        return HEIGHT - 1;
-    }
-
-    fn find_pairs<'a>(&self, key: &K, g: &'a Guard) -> Result<NodePosition<'a, K, V>, NodePosition<'a, K, V>> {
+    /// If a node with the given key is found, returns `Ok` containing its predecessor and either itself for each level
+    /// where it's linked or its sucessor for each level where it's not linked. If a node with the given key is not found,
+    /// returns `Err` containing the first node whose hash is larger than the given key's hash and its predecessor at every
+    /// level. That predecessor may not have the same key as the given key, but may have the same hash. This method also
+    /// unlinks all marked nodes it encounters.
+    fn find_pairs<'a, Q: ?Sized>(&self, key: &Q, g: &'a Guard) -> Result<NodePosition<'a, K, V>, NodePosition<'a, K, V>>
+        where K: Borrow<Q>,
+              Q: Eq + Hash
+    {
         let hash = self.hash(key);
 
         // "The Position" refers to the position where a node with the given key should be or is.
         // This list points to nodes before the Position at every level.
-        // TODO what about panics? might be UB, although OTOH panics here are UB anyway
+        // TODO what about panics? might be UB, are there other UB situations possible?
         let mut preds: [Shared<Node<K, V>>; HEIGHT] = unsafe { mem::uninitialized() };
         // This list at every level points to nodes either after the Position or at the Position if a node with the given key exists.
         let mut currs: [Shared<Node<K, V>>; HEIGHT] = unsafe { mem::uninitialized() };
@@ -191,7 +199,7 @@ impl<K, V, S> EpochSkiplistMap<K, V, S> where K: Eq + Hash, S: BuildHasher {
                         break;
                     }
 
-                    if (curr.hash() == hash && curr.key() == key) || curr.hash() > hash {
+                    if (curr.hash() == hash && curr.key().borrow() == key) || curr.hash() > hash {
                         // The next node falls after the Position, we're done on this level.
                         break;
                     }
@@ -201,8 +209,6 @@ impl<K, V, S> EpochSkiplistMap<K, V, S> where K: Eq + Hash, S: BuildHasher {
 
                     curr = curr_next.0.unwrap();
                 }
-                // TODO what if TAIL should be curr? this will be wrong then
-
                 // Pred and curr can be not adjacent if there is a sequence of marked nodes between them
                 // or if a new node was inserted between them during our search.
                 if (pred_next.0.unwrap().as_raw() != curr.as_raw())
@@ -223,7 +229,7 @@ impl<K, V, S> EpochSkiplistMap<K, V, S> where K: Eq + Hash, S: BuildHasher {
                 }
             }
 
-            if currs[0].is_data() && currs[0].key() == key {
+            if currs[0].is_data() && currs[0].key().borrow() == key {
                 return Ok(NodePosition {
                     preds: preds,
                     // currs
@@ -240,13 +246,26 @@ impl<K, V, S> EpochSkiplistMap<K, V, S> where K: Eq + Hash, S: BuildHasher {
         }
     }
 
-    // TODO can we make the list eager with epoch? Read H&S to find out why it's lazy in the first place.
-    pub fn cleanup(&self) {
+    /// Returns a randomly chosen level in range [0;HEIGHT), where the probability
+    /// of choosing level L is PROB^(L+1).
+    // PROB is currently hardwired to 1/2.
+    fn random_level(&self) -> usize {
+        use rand;
 
+        // thanks to http://ticki.github.io/blog/skip-lists-done-right/
+        // TODO think about what rng to use, thread-local or not, etc
+        let r: u64 = rand::random::<u64>() & ((1 << HEIGHT) - 1);
+        for i in 0..HEIGHT {
+            if (r >> i) & 1 == 1 {
+                return i;
+            }
+        }
+        return HEIGHT - 1;
     }
 
+    /// Inserts a key-value pair into the map. Fails if a node with the given key already exists. Returns whether
+    /// the insert was successful.
     pub fn insert(&self, key: K, val: V) -> bool {
-        // TODO document
         use init_with::InitWith;
 
         let guard = pin();
@@ -263,15 +282,18 @@ impl<K, V, S> EpochSkiplistMap<K, V, S> where K: Eq + Hash, S: BuildHasher {
         loop {
             match self.find_pairs(new.key(), &guard) {
                 Ok(_) => {
+                    // Key is already taken, operation failed.
                     return false;
                 },
                 Err(acc) => {
                     let mut acc = acc;
 
+                    // Set the new node's nexts to point to locations following where it should be.
                     for lvl in (0...new.top_level()).rev() {
                         new.nexts()[lvl].store_shared(Some(acc.currs_or_nexts[lvl]), false, Ordering::SeqCst);
                     }
 
+                    // Inserting the node into the bottom level logically adds it to the map.
                     let new_ref = match acc.preds[0].nexts()[0].cas_and_ref(
                         Some(acc.currs_or_nexts[0]), false,
                         new, false,
@@ -282,30 +304,39 @@ impl<K, V, S> EpochSkiplistMap<K, V, S> where K: Eq + Hash, S: BuildHasher {
                         },
                         Err(new_back) => {
                             new = new_back;
+                            // We failed to insert the node, retry.
                             continue;
                         },
                     };
 
+                    // Inserting the node into higher levels must be done with care,
+                    // since it's already accessible from the list and must be valid at all times.
                     for lvl in 1...top_level {
                         loop {
-                            let pred = acc.preds[lvl];
-                            let mut next = acc.currs_or_nexts[lvl];
+                            //let pred = acc.preds[lvl];
+                            let /*mut*/ next = acc.currs_or_nexts[lvl];
 
-                            // Update the forward pointer if it is stale
+                            // We have to check whether the new node's forward pointers are still valid at each level before
+                            // inserting it there.
                             let new_next = new_ref.nexts()[lvl].load(Ordering::SeqCst, &guard).0.unwrap();
                             if (new_next.as_raw() != next.as_raw())
                             && !new_ref.nexts()[lvl].cas_shared(Some(new_next), false, Some(next), false, Ordering::SeqCst) {
                                 break; // Give up if pointer is marked
                             }
 
-                            if next.is_data() && next.key() == new_ref.key() {
+                            // If the list is already inserted at this level.. wat?
+                            // TODO Fraser does this, but it's impossible for a node to already be at a level where it
+                            // wasn't yet inserted.
+                            /*if next.is_data() && next.key() == new_ref.key() {
                                 next = next.nexts()[lvl].load(Ordering::SeqCst, &guard).0.unwrap();
-                            }
+                            }*/
 
+                            // Insert the node at the given level.
                             if acc.preds[lvl].nexts()[lvl].cas_shared(Some(next), false, Some(new_ref), false, Ordering::SeqCst) {
                                 break;
                             }
 
+                            // If we failed to insert above, redo search to find out where our node should be.
                             acc = match self.find_pairs(new_ref.key(), &guard) {
                                 Ok(acc) => acc,
                                 // TODO doesn't this mean that we already got deleted and should abandon linking higher levels?
@@ -320,7 +351,12 @@ impl<K, V, S> EpochSkiplistMap<K, V, S> where K: Eq + Hash, S: BuildHasher {
         }
     }
 
-    pub fn remove(&self, key: &K) -> Option<V> {
+    /// If a node with the given key is found, removes it from the map and returns its value in `Some`.
+    /// Otherwise returns `None`.
+    pub fn remove<Q: ?Sized>(&self, key: &Q) -> Option<V>
+        where K: Borrow<Q>,
+              Q: Eq + Hash
+    {
         let guard = pin();
         // Maps Err to None, since if a node wasn't found there is nothing to remove
         // and then executes remove on Ok(acc: NodePosition).
@@ -347,14 +383,16 @@ impl<K, V, S> EpochSkiplistMap<K, V, S> where K: Eq + Hash, S: BuildHasher {
             if i_marked_it {
                 // TODO optimize and try to CAS acc.preds instead.
                 self.find_pairs(key, &guard).is_ok();
-                unsafe {
-                    guard.unlinked(node_to_remove);
-                }
 
-                // We can just move it out regardless of whether it's Copy or Clone since the memory will get freed,
-                // but not dropped by the epoch GC.
-                // TODO shouldn't we also move out/drop the key and maybe other parts of Node<K, V>? Otherwise, anything they own will leak.
-                Some(unsafe { node_to_remove.val_cpy() } )
+                unsafe {
+                    // This is fine since find_pairs is guaranteed to unlink (make unreachable) the node we search for.
+                    guard.unlinked(node_to_remove);
+
+                    // We can just move the key and val out regardless of whether they're Copy or Clone,
+                    // since the memory will get freed but not dropped by the epoch GC.
+                    ptr::drop_in_place(node_to_remove.key() as *const K as *mut K);
+                    Some(node_to_remove.val_cpy())
+                }
             }
             else {
                 None
@@ -362,7 +400,13 @@ impl<K, V, S> EpochSkiplistMap<K, V, S> where K: Eq + Hash, S: BuildHasher {
         } )
     }
 
-    fn find_no_cleanup<'a>(&self, key: &K, g: &'a Guard) -> Option<Shared<'a, Node<K, V>>> {
+    /// If a node with the given key exists, returns a shared pointer to it in `Some`.
+    /// Otherwise returns `None`. Unlike `find_pairs`, this operation does not unlink marked
+    /// nodes and hence is faster.
+    fn find_no_cleanup<'a, Q: ?Sized>(&self, key: &Q, g: &'a Guard) -> Option<Shared<'a, Node<K, V>>>
+        where K: Borrow<Q>,
+              Q: Eq + Hash
+    {
         let hash = self.hash(key);
 
         let mut pred: Shared<Node<K, V>> = self.head.load(Ordering::SeqCst, &g).unwrap();
@@ -371,7 +415,7 @@ impl<K, V, S> EpochSkiplistMap<K, V, S> where K: Eq + Hash, S: BuildHasher {
             while curr.is_data() {
                 let curr_next: (Option<Shared<Node<K, V>>>, bool) = curr.nexts()[lvl].load(Ordering::SeqCst, &g);
 
-                if !curr_next.1 && curr.hash() == hash && curr.key() == key {
+                if !curr_next.1 && curr.hash() == hash && curr.key().borrow() == key {
                     return Some(curr);
                 }
                 else if curr.hash() > hash {
@@ -385,11 +429,29 @@ impl<K, V, S> EpochSkiplistMap<K, V, S> where K: Eq + Hash, S: BuildHasher {
         None
     }
 
-    pub fn contains(&self, key: &K) -> bool {
+    /// Returns whether the map contains a node with the given key.
+    pub fn contains<Q: ?Sized>(&self, key: &Q) -> bool
+        where K: Borrow<Q>,
+              Q: Eq + Hash
+    {
         let guard = pin();
         self.find_no_cleanup(key, &guard).is_some()
     }
 
+    /// If a node with the given key exists, returns the clone of its value in `Some`.
+    /// Otherwise returns `None`.
+    pub fn find<Q: ?Sized>(&self, key: &Q) -> Option<V>
+        where K: Borrow<Q>,
+              Q: Eq + Hash,
+              V: Clone
+    {
+        let guard = pin();
+        self.find_no_cleanup(key, &guard).and_then(|node| {
+            Some(node.val().clone())
+        } )
+    }
+
+    /// Returns the size of the map, that is the amount of key-value pairs in it.
     pub fn size(&self) -> usize {
         let guard = pin();
         let mut curr: Shared<Node<K, V>> = self.head.load(Ordering::SeqCst, &guard).unwrap().nexts()[0].load(Ordering::SeqCst, &guard).0.unwrap();
@@ -404,15 +466,8 @@ impl<K, V, S> EpochSkiplistMap<K, V, S> where K: Eq + Hash, S: BuildHasher {
         count
     }
 
-    pub fn find(&self, key: &K) -> Option<V> where V: Clone {
-        let guard = pin();
-        self.find_no_cleanup(key, &guard).and_then(|node| {
-            Some(node.val().clone())
-        } )
-    }
-
-    pub fn swap(&self, key: &K, new: V) -> Option<V> {
-        // TODO
+    fn _swap(&self, _key: &K, _new: V) -> Option<V> {
+        // TODO? Which atomic operations do we want to support?
         None
     }
 }
@@ -428,7 +483,9 @@ mod tests {
 
     use super::*;
 
-    fn with_def_hasher<K, V>() -> EpochSkiplistMap<K, V, BuildHasherDefault<DefaultHasher>> where K: Eq + Hash {
+    fn with_def_hasher<K, V>() -> EpochSkiplistMap<K, V, BuildHasherDefault<DefaultHasher>>
+        where K: Eq + Hash
+    {
         let build = BuildHasherDefault::<DefaultHasher>::default();
         EpochSkiplistMap::with_hash_factory(build)
     }
@@ -481,11 +538,28 @@ mod tests {
         }
     }
 
+    fn st_leak_k(k_loops: usize) {
+        let map: EpochSkiplistMap<Box<usize>, Box<usize>, _> = with_def_hasher();
+
+        for i in 0..k_loops {
+            map.insert(Box::new(i), Box::new(i));
+        }
+        for i in 0..(k_loops/2) {
+            map.remove(&Box::new(i));
+        }
+    }
+
+    #[test]
+    fn st_leak() {
+        st_leak_k(1);
+        st_leak_k(10);
+    }
+
     struct U32(u32);
     fn mt_n_test<F: Fn(usize)>(f: F) {
         f(2);
-        //f(4);
-        //f(8);
+        f(4);
+        f(8);
     }
 
     fn mt_n_insert_k(n_threads: usize, k_loops: usize) {
@@ -527,6 +601,10 @@ mod tests {
                     for j in 0..k_loops {
                         let i = k_loops as u32*i + j as u32;
                         map.insert(i, i+1);
+                    }
+
+                    for j in 0..k_loops {
+                        let i = k_loops as u32*i + j as u32;
                         let removed = map.remove(&i);
                         assert!(removed.is_some());
                         assert!(removed.unwrap() == i+1);
@@ -545,7 +623,7 @@ mod tests {
         mt_n_test(|n| { mt_n_remove_k(n, 100) } );
     }
 
-    fn mt_n_afl(n_threads: usize) {
+    fn mt_n_afl(_n_threads: usize) {
         // TODO
     }
 
