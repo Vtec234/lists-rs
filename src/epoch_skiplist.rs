@@ -5,6 +5,10 @@ use std::borrow::Borrow;
 use std::mem;
 use std::ptr;
 
+/// A lock-free concurrent skiplist-based map with epoch GC memory reclamation.
+///
+/// This structure is based on Keir Fraser's algorithm from [his PhD thesis]
+/// (https://www.cl.cam.ac.uk/techreports/UCAM-CL-TR-579.pdf).
 // TODO make Debug not rely on K: Debug, V: Debug, S: Debug.
 #[derive(Debug)]
 pub struct EpochSkiplistMap<K, V, S> {
