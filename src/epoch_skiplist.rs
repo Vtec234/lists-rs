@@ -362,11 +362,32 @@ impl<K, V, S> EpochSkiplistMap<K, V, S> where K: Eq + Hash, S: BuildHasher {
         } )
     }
 
+    fn find_no_cleanup<'a>(&self, key: &K, g: &'a Guard) -> Option<Shared<'a, Node<K, V>>> {
+        let hash = self.hash(key);
+
+        let mut pred: Shared<Node<K, V>> = self.head.load(Ordering::SeqCst, &g).unwrap();
+        for lvl in (0...TOP_LEVEL).rev() {
+            let mut curr: Shared<Node<K, V>> = pred.nexts()[lvl].load(Ordering::SeqCst, &g).0.unwrap();
+            while curr.is_data() {
+                let curr_next: (Option<Shared<Node<K, V>>>, bool) = curr.nexts()[lvl].load(Ordering::SeqCst, &g);
+
+                if !curr_next.1 && curr.hash() == hash && curr.key() == key {
+                    return Some(curr);
+                }
+                else if curr.hash() > hash {
+                    break;
+                }
+
+                pred = curr;
+                curr = curr_next.0.unwrap();
+            }
+        }
+        None
+    }
+
     pub fn contains(&self, key: &K) -> bool {
-        // TODO make wait-free
         let guard = pin();
-        let pr = self.find_pairs(key, &guard);
-        pr.is_ok()
+        self.find_no_cleanup(key, &guard).is_some()
     }
 
     pub fn size(&self) -> usize {
@@ -384,27 +405,10 @@ impl<K, V, S> EpochSkiplistMap<K, V, S> where K: Eq + Hash, S: BuildHasher {
     }
 
     pub fn find(&self, key: &K) -> Option<V> where V: Clone {
-        let hash = self.hash(key);
-
         let guard = pin();
-        let mut pred: Shared<Node<K, V>> = self.head.load(Ordering::SeqCst, &guard).unwrap();
-        for lvl in (0...TOP_LEVEL).rev() {
-            let mut curr: Shared<Node<K, V>> = pred.nexts()[lvl].load(Ordering::SeqCst, &guard).0.unwrap();
-            while curr.is_data() {
-                let curr_next: (Option<Shared<Node<K, V>>>, bool) = curr.nexts()[lvl].load(Ordering::SeqCst, &guard);
-
-                if !curr_next.1 && curr.hash() == hash && curr.key() == key {
-                    return Some(curr.val().clone());
-                }
-                else if curr.hash() > hash {
-                    break;
-                }
-
-                pred = curr;
-                curr = curr_next.0.unwrap();
-            }
-        }
-        None
+        self.find_no_cleanup(key, &guard).and_then(|node| {
+            Some(node.val().clone())
+        } )
     }
 
     pub fn swap(&self, key: &K, new: V) -> Option<V> {
