@@ -49,9 +49,8 @@ impl<K, V> Node<K, V> {
     fn nexts(&self) -> &[MarkableAtomic<Node<K, V>>; HEIGHT] {
         use self::Node::*;
 
-        match self {
-            &Head { ref nexts } => nexts,
-            &Data { ref nexts, .. } => nexts,
+        match *self {
+            Head { ref nexts } | Data { ref nexts, .. } => nexts,
             _ => panic!("1"),
         }
     }
@@ -59,47 +58,46 @@ impl<K, V> Node<K, V> {
     fn is_data(&self) -> bool {
         use self::Node::*;
 
-        if let &Data { .. } = self { true } else { false }
+        if let Data { .. } = *self { true } else { false }
     }
 
     fn is_tail(&self) -> bool {
         use self::Node::*;
 
-        if let &Tail = self { true } else { false }
+        if let Tail = *self { true } else { false }
     }
 
     fn key(&self) -> &K {
         use self::Node::*;
 
-        if let &Data { ref key, .. } = self { key } else { panic!("2") }
+        if let Data { ref key, .. } = *self { key } else { panic!("2") }
     }
 
     fn val(&self) -> &V {
         use self::Node::*;
 
-        if let &Data { ref val, .. } = self { val } else { panic!("20") }
+        if let Data { ref val, .. } = *self { val } else { panic!("20") }
     }
 
     fn hash(&self) -> u64 {
         use self::Node::*;
 
-        if let &Data { hash, .. } = self { hash } else { panic!("3") }
+        if let Data { hash, .. } = *self { hash } else { panic!("3") }
     }
 
     fn top_level(&self) -> usize {
         use self::Node::*;
 
-        match self {
-            &Data { top_level, .. } => top_level,
-            &Head { .. } => TOP_LEVEL,
-            &Tail => TOP_LEVEL,
+        match *self {
+            Data { top_level, .. } => top_level,
+            Head { .. } | Tail => TOP_LEVEL,
         }
     }
 
     unsafe fn val_cpy(&self) -> V {
         use self::Node::*;
 
-        if let &Data { ref val, .. } = self { ptr::read(val as *const _ as *mut _) } else { panic!("21") }
+        if let Data { ref val, .. } = *self { ptr::read(val as *const _ as *mut _) } else { panic!("21") }
     }
 }
 
@@ -264,7 +262,7 @@ impl<K, V, S> EpochSkiplistMap<K, V, S>
                 return i;
             }
         }
-        return HEIGHT - 1;
+        HEIGHT - 1
     }
 
     /// Inserts a key-value pair into the map. Fails if a node with the given key already exists. Returns whether
@@ -342,9 +340,8 @@ impl<K, V, S> EpochSkiplistMap<K, V, S>
 
                             // If we failed to insert above, redo search to find out where our node should be.
                             acc = match self.find_pairs(new_ref.key(), &guard) {
-                                Ok(acc) => acc,
-                                // TODO doesn't this mean that we already got deleted and should abandon linking higher levels?
-                                Err(acc) => acc,
+                                // TODO doesn't Err here mean that we already got deleted and should abandon linking higher levels?
+                                Ok(acc) | Err(acc) => acc,
                             };
                         }
                     }
@@ -413,11 +410,11 @@ impl<K, V, S> EpochSkiplistMap<K, V, S>
     {
         let hash = self.hash(key);
 
-        let mut pred: Shared<Node<K, V>> = self.head.load(Ordering::SeqCst, &g).unwrap();
+        let mut pred: Shared<Node<K, V>> = self.head.load(Ordering::SeqCst, g).unwrap();
         for lvl in (0...TOP_LEVEL).rev() {
-            let mut curr: Shared<Node<K, V>> = pred.nexts()[lvl].load(Ordering::SeqCst, &g).0.unwrap();
+            let mut curr: Shared<Node<K, V>> = pred.nexts()[lvl].load(Ordering::SeqCst, g).0.unwrap();
             while curr.is_data() {
-                let curr_next: (Option<Shared<Node<K, V>>>, bool) = curr.nexts()[lvl].load(Ordering::SeqCst, &g);
+                let curr_next: (Option<Shared<Node<K, V>>>, bool) = curr.nexts()[lvl].load(Ordering::SeqCst, g);
 
                 if !curr_next.1 && curr.hash() == hash && curr.key().borrow() == key {
                     return Some(curr);
@@ -463,7 +460,7 @@ impl<K, V, S> EpochSkiplistMap<K, V, S>
         while curr.is_data() {
             let pr = curr.nexts()[0].load(Ordering::SeqCst, &guard);
             if !pr.1 {
-                count = count + 1;
+                count += 1;
             }
             curr = pr.0.unwrap();
         }

@@ -24,6 +24,12 @@ pub struct ArrayOfThings {
 const ARRAY_OF_THINGS_COUNT: usize = 16384;
 const PAGE_SIZE: usize = 4096;
 
+impl Default for ArrayOfThings {
+    fn default() -> ArrayOfThings {
+        ArrayOfThings::new()
+    }
+}
+
 impl ArrayOfThings {
 	pub fn new() -> ArrayOfThings {
 		unsafe {

@@ -42,9 +42,8 @@ impl<K, V> Node<K, V> {
     fn next(&self) -> &MarkableArcCell<Node<K, V>> {
         use self::Node::*;
 
-        match self {
-            &Head { ref next } => next,
-            &Data { ref next, .. } => next,
+        match *self {
+            Head { ref next } | Data { ref next, .. } => next,
             _ => panic!(),
         }
     }
@@ -52,19 +51,19 @@ impl<K, V> Node<K, V> {
     fn is_data(&self) -> bool {
         use self::Node::*;
 
-        if let &Data { .. } = self { true } else { false }
+        if let Data { .. } = *self { true } else { false }
     }
 
     fn key(&self) -> &K {
         use self::Node::*;
 
-        if let &Data { ref key, .. } = self { key } else { panic!() }
+        if let Data { ref key, .. } = *self { key } else { panic!() }
     }
 
     fn hash(&self) -> u64 {
         use self::Node::*;
 
-        if let &Data { hash, .. } = self { hash } else { panic!() }
+        if let Data { hash, .. } = *self { hash } else { panic!() }
     }
 }
 
@@ -333,7 +332,7 @@ impl<K, V, S> ConcurrentLazyList<K, V, S> where K: Eq + Hash, S: BuildHasher {
         let mut count = 0;
         while curr.is_data() {
             if !curr.next().is_marked() {
-                count = count + 1;
+                count += 1;
             }
             curr = curr.next().get_arc();
         }

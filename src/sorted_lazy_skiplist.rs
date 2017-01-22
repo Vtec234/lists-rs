@@ -60,9 +60,8 @@ impl<K, V> Node<K, V> {
     fn nexts(&self) -> &[Option<MarkableArcCell<Node<K, V>>>; HEIGHT] {
         use self::Node::*;
 
-        match self {
-            &Head { ref nexts } => nexts,
-            &Data { ref nexts, .. } => nexts,
+        match *self {
+            Head { ref nexts } | Data { ref nexts, .. } => nexts,
             _ => panic!("6"),
         }
     }
@@ -70,28 +69,27 @@ impl<K, V> Node<K, V> {
     fn is_data(&self) -> bool {
         use self::Node::*;
 
-        if let &Data { .. } = self { true } else { false }
+        if let Data { .. } = *self { true } else { false }
     }
 
     fn key(&self) -> &K {
         use self::Node::*;
 
-        if let &Data { ref key, .. } = self { key } else { panic!("3") }
+        if let Data { ref key, .. } = *self { key } else { panic!("3") }
     }
 
     fn hash(&self) -> u64 {
         use self::Node::*;
 
-        if let &Data { hash, .. } = self { hash } else { panic!("4") }
+        if let Data { hash, .. } = *self { hash } else { panic!("4") }
     }
 
     fn top_level(&self) -> usize {
         use self::Node::*;
 
-        match self {
-            &Data { top_level, .. } => top_level,
-            &Head { .. } => TOP_LEVEL,
-            &Tail => TOP_LEVEL,
+        match *self {
+            Data { top_level, .. } => top_level,
+            Head { .. } | Tail => TOP_LEVEL,
         }
     }
 }
@@ -202,7 +200,7 @@ impl<K, V, S> LRCSkiplistMap<K, V, S> where K: Eq + Hash, S: BuildHasher {
                 return i;
             }
         }
-        return HEIGHT - 1;
+        HEIGHT - 1
     }
 
     /// If a node with the given key was found, returns `Ok` containing its predecessor and either
@@ -382,9 +380,8 @@ impl<K, V, S> LRCSkiplistMap<K, V, S> where K: Eq + Hash, S: BuildHasher {
 
                             // if inserting at given level failed we have to redo search
                             acc = match self.find_pairs(new.key()) {
-                                Ok(acc) => acc,
                                 // TODO can we abandon inserting as an optimization if find returns Err here?
-                                Err(acc) => acc,
+                                Ok(acc) | Err(acc) => acc,
                             };
                         }
                     }
@@ -424,12 +421,12 @@ impl<K, V, S> LRCSkiplistMap<K, V, S> where K: Eq + Hash, S: BuildHasher {
         } // for
 
         if curr.is_data() && curr.key() == key {
-            return Some(LRCSkiplistMapAccessor {
+            Some(LRCSkiplistMapAccessor {
                 acc: curr,
-            } );
+            } )
         }
         else {
-            return None;
+            None
         }
     } // fn
 
@@ -476,7 +473,7 @@ impl<K, V, S> LRCSkiplistMap<K, V, S> where K: Eq + Hash, S: BuildHasher {
                 } )
             }
             else {
-                return None;
+                None
             }
         } )
     } // fn
@@ -498,7 +495,7 @@ impl<K, V, S> LRCSkiplistMap<K, V, S> {
         let mut count = 0;
         while curr.is_data() {
             if !curr.nexts()[0].as_ref().unwrap().is_marked() {
-                count = count + 1;
+                count += 1;
             }
             curr = curr.nexts()[0].as_ref().unwrap().get_arc();
         }
