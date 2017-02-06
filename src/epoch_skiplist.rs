@@ -391,7 +391,8 @@ impl<K, V, S> EpochSkiplistMap<K, V, S>
 
                     // We can just move the key and val out regardless of whether they're Copy or Clone,
                     // since the memory will get freed but not dropped by the epoch GC.
-                    ptr::drop_in_place(node_to_remove.key() as *const K as *mut K);
+                    // TODO This was a bug. We need deferred destruction in the epoch collector.
+                    //ptr::drop_in_place(node_to_remove.key() as *const K as *mut K);
                     Some(node_to_remove.val_cpy())
                 }
             }
