@@ -1,9 +1,10 @@
-use crossbeam::mem::epoch::*;
+use crossbeam_epoch::*;
 use std::hash::{Hash, BuildHasher};
 use std::sync::atomic::Ordering;
 use std::borrow::Borrow;
 use std::mem;
 use std::ptr;
+use std::fmt;
 
 /// A lock-free concurrent skiplist-based map with epoch GC memory reclamation.
 ///
@@ -32,26 +33,26 @@ const TOP_LEVEL: usize = HEIGHT - 1;
 #[derive(Debug)]
 enum Node<K, V> {
     Head {
-        nexts: [MarkableAtomic<Node<K, V>>; HEIGHT],
+        nexts: [Atomic<Node<K, V>>; HEIGHT],
     },
     Data {
         hash: u64,
         key: K,
-        val: V,
+        val: Option<V>,
 
-        nexts: [MarkableAtomic<Node<K, V>>; HEIGHT],
+        nexts: [Atomic<Node<K, V>>; HEIGHT],
         top_level: usize,
     },
     Tail,
 }
 
 impl<K, V> Node<K, V> {
-    fn nexts(&self) -> &[MarkableAtomic<Node<K, V>>; HEIGHT] {
+    fn nexts(&self) -> &[Atomic<Node<K, V>>; HEIGHT] {
         use self::Node::*;
 
         match *self {
             Head { ref nexts } | Data { ref nexts, .. } => nexts,
-            _ => panic!("1"),
+            _ => panic!("!!"),
         }
     }
 
@@ -70,19 +71,25 @@ impl<K, V> Node<K, V> {
     fn key(&self) -> &K {
         use self::Node::*;
 
-        if let Data { ref key, .. } = *self { key } else { panic!("2") }
+        if let Data { ref key, .. } = *self { key } else { panic!("!!") }
     }
 
     fn val(&self) -> &V {
         use self::Node::*;
 
-        if let Data { ref val, .. } = *self { val } else { panic!("20") }
+        if let Data { ref val, .. } = *self { val.as_ref().unwrap() } else { panic!("!!") }
+    }
+
+    fn val_opt_mut(&mut self) -> &mut Option<V> {
+        use self::Node::*;
+
+        if let Data { ref mut val, .. } = *self { val } else { panic!("!!") }
     }
 
     fn hash(&self) -> u64 {
         use self::Node::*;
 
-        if let Data { hash, .. } = *self { hash } else { panic!("3") }
+        if let Data { hash, .. } = *self { hash } else { panic!("!!") }
     }
 
     fn top_level(&self) -> usize {
@@ -93,12 +100,6 @@ impl<K, V> Node<K, V> {
             Head { .. } | Tail => TOP_LEVEL,
         }
     }
-
-    unsafe fn val_cpy(&self) -> V {
-        use self::Node::*;
-
-        if let Data { ref val, .. } = *self { ptr::read(val as *const _ as *mut _) } else { panic!("21") }
-    }
 }
 
 impl<K, V, S> Drop for EpochSkiplistMap<K, V, S> {
@@ -107,15 +108,19 @@ impl<K, V, S> Drop for EpochSkiplistMap<K, V, S> {
         let _ = pin();
         let _ = pin();
         let guard = pin();
-        let mut pred: Shared<Node<K, V>> = self.head.load(Ordering::Relaxed, &guard).unwrap();
-        while !pred.is_tail() {
-            let curr: Shared<Node<K, V>> = pred.nexts()[0].load(Ordering::Relaxed, &guard).0.unwrap();
-            // Drop is statically guaranteed to only run on a single thread - we can deallocate 'by hand'.
-            unsafe { Box::from_raw(pred.as_raw()); };
-            pred = curr;
+        let mut pred: Shared<Node<K, V>> = self.head.load(Ordering::Relaxed, &guard);
+
+        unsafe {
+            while !pred.deref().is_tail() {
+                let curr: Shared<Node<K, V>> = pred.deref().nexts()[0].load(Ordering::Relaxed, &guard);
+                // Drop is statically guaranteed to only run on a single thread - we can deallocate 'by hand'.
+                Box::from_raw(pred.as_raw() as *mut Node<K, V>);
+                pred = curr;
+            }
+
+            // Dispose of tail.
+            Box::from_raw(pred.as_raw() as *mut Node<K, V>);
         }
-        // Dispose of tail.
-        unsafe { Box::from_raw(pred.as_raw()); };
     }
 }
 
@@ -123,6 +128,14 @@ struct NodePosition<'a, K: 'a, V: 'a> {
     preds: [Shared<'a, Node<K, V>>; HEIGHT],
     currs_or_nexts: [Shared<'a, Node<K, V>>; HEIGHT],
 }
+
+impl<'a, K: 'a, V: 'a> fmt::Debug  for NodePosition<'a, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("NodePosition")
+            .finish()
+    }
+}
+
 
 impl<K, V, S> EpochSkiplistMap<K, V, S>
     where K: Eq + Hash,
@@ -136,8 +149,8 @@ impl<K, V, S> EpochSkiplistMap<K, V, S>
         EpochSkiplistMap {
             head: Atomic::new(
                 Node::Head {
-                    nexts: <[MarkableAtomic<Node<K, V>>; HEIGHT]>::init_with(|| {
-                        unsafe { MarkableAtomic::from_ptr(tail, false) }
+                    nexts: <[Atomic<Node<K, V>>; HEIGHT]>::init_with(|| {
+                        unsafe { Atomic::from(Owned::from_raw(tail)) }
                     } ),
                 }
             ),
@@ -173,77 +186,78 @@ impl<K, V, S> EpochSkiplistMap<K, V, S>
         // This list at every level points to nodes either after the Position or at the Position if a node with the given key exists.
         let mut currs: [Shared<Node<K, V>>; HEIGHT] = unsafe { mem::uninitialized() };
 
-        // We execute the standard skiplist search algorithm by moving right and descending levels when the next node comes after the Position.
-        'begin_from_head: loop {
-            let mut pred: Shared<Node<K, V>> = self.head.load(Ordering::SeqCst, g).unwrap();
-            for lvl in (0...TOP_LEVEL).rev() {
-                let mut pred_next: (Option<Shared<Node<K, V>>>, bool) = pred.nexts()[lvl].load(Ordering::SeqCst, g);
-                if pred_next.1 {
-                    // TODO why? Fraser does this, H&S doesn't.
-                    continue 'begin_from_head;
-                }
+        unsafe {
+            // We execute the standard skiplist search algorithm by moving right and descending levels when the next node comes after the Position.
+            'begin_from_head: loop {
+                let mut pred: Shared<Node<K, V>> = self.head.load(Ordering::SeqCst, g);
+                for lvl in (0..=TOP_LEVEL).rev() {
+                    let mut pred_next: Shared<Node<K, V>> = pred.deref().nexts()[lvl].load(Ordering::SeqCst, g);
+                    if pred_next.tag() == 1 {
+                        // TODO why? Fraser does this, H&S doesn't.
+                        continue 'begin_from_head;
+                    }
 
-                let mut curr: Shared<Node<K, V>> = pred_next.0.unwrap();
-                // Loop until we encounter Node::Tail
-                while curr.is_data() {
-                    let mut curr_next: (Option<Shared<Node<K, V>>>, bool) = curr.nexts()[lvl].load(Ordering::SeqCst, g);
-                    // Skip over a sequence of marked nodes if such exists
-                    while curr.is_data() {
-                        curr_next = curr.nexts()[lvl].load(Ordering::SeqCst, g);
-                        if !curr_next.1 {
+                    let mut curr: Shared<Node<K, V>> = pred_next;
+                    // Loop until we encounter Node::Tail
+                    while curr.deref().is_data() {
+                        let mut curr_next: Shared<Node<K, V>> = curr.deref().nexts()[lvl].load(Ordering::SeqCst, g);
+                        // Skip over a sequence of marked nodes if such exists
+                        while curr.deref().is_data() {
+                            curr_next = curr.deref().nexts()[lvl].load(Ordering::SeqCst, g);
+                            if curr_next.tag() != 1 {
+                                break;
+                            }
+                            // If this node is marked, we keep pred the same and only increment curr so that the CAS below can remove it.
+                            curr = curr_next;
+                        }
+
+                        if !curr.deref().is_data() {
                             break;
                         }
-                        // If this node is marked, we keep pred the same and only increment curr so that the CAS below can remove it.
-                        curr = curr_next.0.unwrap();
+
+                        if (curr.deref().hash() == hash && curr.deref().key().borrow() == key) || curr.deref().hash() > hash {
+                            // The next node falls after the Position, we're done on this level.
+                            break;
+                        }
+
+                        pred = curr;
+                        pred_next = curr_next;
+                        curr = curr_next;
                     }
 
-                    if !curr.is_data() {
-                        break;
+                    // Pred and curr can be not adjacent if there is a sequence of marked nodes between them
+                    // or if a new node was inserted between them during our search.
+                    if (pred_next.as_raw() != curr.as_raw())
+                        // TODO this probably only removes marked nodes if they directly precede the Position. Not strictly incorrect, but might hog memory.
+                        // This CAS only fires for the case of marked nodes, since removing an inserted one would be incorrect.
+                        && pred.deref().nexts()[lvl].compare_and_set(
+                            pred_next,
+                            curr.with_tag(pred_next.tag()),
+                            Ordering::SeqCst,
+                            &g).is_err()
+                    {
+                        // If we fail, something changed in the neighbourhood, so restart search.
+                        continue 'begin_from_head;
                     }
 
-                    if (curr.hash() == hash && curr.key().borrow() == key) || curr.hash() > hash {
-                        // The next node falls after the Position, we're done on this level.
-                        break;
-                    }
-
-                    pred = curr;
-                    pred_next = curr_next;
-
-                    curr = curr_next.0.unwrap();
-                }
-                // Pred and curr can be not adjacent if there is a sequence of marked nodes between them
-                // or if a new node was inserted between them during our search.
-                if (pred_next.0.unwrap().as_raw() != curr.as_raw())
-                // TODO this probably only removes marked nodes if they directly precede the Position. Not strictly incorrect, but might hog memory.
-                // This CAS only fires for the case of marked nodes, since removing an inserted one would be incorrect.
-                && !pred.nexts()[lvl].cas_shared(
-                    pred_next.0, pred_next.1,
-                    Some(curr), pred_next.1,
-                    Ordering::SeqCst)
-                {
-                    // If we fail, something changed in the neighbourhood, so restart search.
-                    continue 'begin_from_head;
-                }
-
-                unsafe {
                     ptr::write(&mut preds[lvl] as *mut _, pred);
                     ptr::write(&mut currs[lvl] as *mut _, curr);
                 }
-            }
 
-            if currs[0].is_data() && currs[0].key().borrow() == key {
-                return Ok(NodePosition {
-                    preds: preds,
-                    // currs
-                    currs_or_nexts: currs,
-                } );
-            }
-            else {
-                return Err(NodePosition {
-                    preds: preds,
-                    // nexts
-                    currs_or_nexts: currs,
-                } );
+                if currs[0].deref().is_data() && currs[0].deref().key().borrow() == key {
+                    return Ok(NodePosition {
+                        preds: preds,
+                        // currs
+                        currs_or_nexts: currs,
+                    } );
+                }
+                else {
+                    return Err(NodePosition {
+                        preds: preds,
+                        // nexts
+                        currs_or_nexts: currs,
+                    } );
+                }
             }
         }
     }
@@ -275,79 +289,84 @@ impl<K, V, S> EpochSkiplistMap<K, V, S>
         let mut new = Owned::new(Node::Data {
             hash: self.hash(&key),
             key: key,
-            val: val,
-            nexts: <[MarkableAtomic<Node<K, V>>; HEIGHT]>::init_with(|| {
-                MarkableAtomic::null(false)
+            val: Some(val),
+            nexts: <[Atomic<Node<K, V>>; HEIGHT]>::init_with(|| {
+                Atomic::null()
             } ),
             top_level: top_level,
-        } );
-        loop {
-            match self.find_pairs(new.key(), &guard) {
-                Ok(_) => {
-                    // Key is already taken, operation failed.
-                    return false;
-                },
-                Err(acc) => {
-                    let mut acc = acc;
+        } ).into_shared(&guard);
 
-                    // Set the new node's nexts to point to locations following where it should be.
-                    for lvl in (0...new.top_level()).rev() {
-                        new.nexts()[lvl].store_shared(Some(acc.currs_or_nexts[lvl]), false, Ordering::SeqCst);
-                    }
+        unsafe {
+            loop {
+                match self.find_pairs(new.deref().key(), &guard) {
+                    Ok(_) => {
+                        // Key is already used, operation failed.
+                        return false;
+                    },
+                    Err(acc) => {
+                        let mut acc = acc;
 
-                    // Inserting the node into the bottom level logically adds it to the map.
-                    let new_ref = match acc.preds[0].nexts()[0].cas_and_ref(
-                        Some(acc.currs_or_nexts[0]), false,
-                        new, false,
-                        Ordering::SeqCst, &guard)
-                    {
-                        Ok(new) => {
-                            new
-                        },
-                        Err(new_back) => {
-                            new = new_back;
-                            // We failed to insert the node, retry.
-                            continue;
-                        },
-                    };
+                        // Set the new node's nexts to point to locations following where it should be.
+                        for lvl in (0..=new.deref().top_level()).rev() {
+                            // TODO with_tag here.. wot?
+                            new.deref().nexts()[lvl].store(acc.currs_or_nexts[lvl].with_tag(0), Ordering::SeqCst);
+                        }
 
-                    // Inserting the node into higher levels must be done with care,
-                    // since it's already accessible from the list and must be valid at all times.
-                    for lvl in 1...top_level {
-                        loop {
-                            //let pred = acc.preds[lvl];
-                            let /*mut*/ next = acc.currs_or_nexts[lvl];
+                        // Inserting the node into the bottom level logically adds it to the map.
+                        let new_ref = match acc.preds[0].deref().nexts()[0].compare_and_set(
+                            acc.currs_or_nexts[0].with_tag(0),
+                            new.with_tag(0),
+                            Ordering::SeqCst,
+                            &guard)
+                        {
+                            Ok(new) => {
+                                new
+                            },
+                            Err(cas_err) => {
+                                new = cas_err.new;
+                                // We failed to insert the node, retry.
+                                continue;
+                            },
+                        };
 
-                            // We have to check whether the new node's forward pointers are still valid at each level before
-                            // inserting it there.
-                            let new_next = new_ref.nexts()[lvl].load(Ordering::SeqCst, &guard).0.unwrap();
-                            if (new_next.as_raw() != next.as_raw())
-                            && !new_ref.nexts()[lvl].cas_shared(Some(new_next), false, Some(next), false, Ordering::SeqCst) {
-                                break; // Give up if pointer is marked
-                            }
+                        // Inserting the node into higher levels must be done with care,
+                        // since it's already accessible from the list and must be valid at all times.
+                        for lvl in 1..=top_level {
+                            loop {
+                                //let pred = acc.preds[lvl];
+                                let /*mut*/ next = acc.currs_or_nexts[lvl];
 
-                            // If the list is already inserted at this level.. wat?
-                            // TODO Fraser does this, but it's impossible for a node to already be at a level where it
-                            // wasn't yet inserted.
-                            /*if next.is_data() && next.key() == new_ref.key() {
+                                // We have to check whether the new node's forward pointers are still valid at each level before
+                                // inserting it there.
+                                let new_next = new_ref.deref().nexts()[lvl].load(Ordering::SeqCst, &guard);
+                                if (new_next.as_raw() != next.as_raw())
+                                    && new_ref.deref().nexts()[lvl].compare_and_set(new_next.with_tag(0), next.with_tag(0), Ordering::SeqCst, &guard).is_err() {
+                                        break; // Give up if pointer is marked
+                                    }
+
+                                // If the list is already inserted at this level.. wat?
+                                // TODO Fraser does this, but it's impossible for a node to already be at a level where it
+                                // wasn't yet inserted.
+                                /*if next.is_data() && next.key() == new_ref.key() {
                                 next = next.nexts()[lvl].load(Ordering::SeqCst, &guard).0.unwrap();
                             }*/
 
-                            // Insert the node at the given level.
-                            if acc.preds[lvl].nexts()[lvl].cas_shared(Some(next), false, Some(new_ref), false, Ordering::SeqCst) {
-                                break;
+                                // Insert the node at the given level.
+                                if acc.preds[lvl].deref().nexts()[lvl].compare_and_set(next.with_tag(0), new_ref.with_tag(0), Ordering::SeqCst, &guard).is_ok() {
+                                    break;
+                                }
+
+                                // If we failed to insert above, redo search to find out where our node should be.
+                                acc = match self.find_pairs(new_ref.deref().key(), &guard) {
+                                    // TODO doesn't Err here mean that we already got deleted and should abandon linking higher levels?
+                                    Ok(acc) | Err(acc) => acc,
+                                };
                             }
-
-                            // If we failed to insert above, redo search to find out where our node should be.
-                            acc = match self.find_pairs(new_ref.key(), &guard) {
-                                // TODO doesn't Err here mean that we already got deleted and should abandon linking higher levels?
-                                Ok(acc) | Err(acc) => acc,
-                            };
                         }
-                    }
 
-                    return true;
-                },
+                        return true;
+                    },
+                }
             }
         }
     }
@@ -359,47 +378,46 @@ impl<K, V, S> EpochSkiplistMap<K, V, S>
               Q: Eq + Hash
     {
         let guard = pin();
-        // Maps Err to None, since if a node wasn't found there is nothing to remove
-        // and then executes remove on Ok(acc: NodePosition).
-        self.find_pairs(key, &guard).ok().and_then(|acc| {
-            let node_to_remove: Shared<Node<K, V>> = acc.currs_or_nexts[0];
-            // First mark all levels besides 0 top-to-bottom. Node is still logically in the map.
-            for lvl in (1...node_to_remove.top_level()).rev() {
-                let mut node_next = node_to_remove.nexts()[lvl].load(Ordering::SeqCst, &guard);
-                while !node_next.1 {
-                    node_to_remove.nexts()[lvl].cas_shared(node_next.0, false, node_next.0, true, Ordering::SeqCst);
-                    node_next = node_to_remove.nexts()[lvl].load(Ordering::SeqCst, &guard);
+
+        unsafe {
+            // Maps Err to None, since if a node wasn't found there is nothing to remove
+            // and then executes remove on Ok(acc: NodePosition).
+            self.find_pairs(key, &guard).ok().and_then(|acc| {
+                let node_to_remove: Shared<Node<K, V>> = acc.currs_or_nexts[0];
+                // First mark all levels besides 0 top-to-bottom. Node is still logically in the map.
+                for lvl in (1..=node_to_remove.deref().top_level()).rev() {
+                    let mut node_next = node_to_remove.deref().nexts()[lvl].load(Ordering::SeqCst, &guard);
+                    while node_next.tag() != 1 {
+                        node_to_remove.deref().nexts()[lvl].compare_and_set(node_next.with_tag(0), node_next.with_tag(1), Ordering::SeqCst, &guard).is_ok();
+                        node_next = node_to_remove.deref().nexts()[lvl].load(Ordering::SeqCst, &guard);
+                    }
                 }
-            }
 
-            let mut node_next = node_to_remove.nexts()[0].load(Ordering::SeqCst, &guard);
-            let mut i_marked_it = false;
-            while !node_next.1 {
-                // Marking the bottom level reference logically removes the node from the map. The thread which succeeds
-                // in doing so must also move the value out.
-                i_marked_it = node_to_remove.nexts()[0].cas_shared(node_next.0, false, node_next.0, true, Ordering::SeqCst);
-                node_next = node_to_remove.nexts()[0].load(Ordering::SeqCst, &guard);
-            }
+                let mut node_next = node_to_remove.deref().nexts()[0].load(Ordering::SeqCst, &guard);
+                let mut i_marked_it = false;
+                while node_next.tag() != 1 {
+                    // Marking the bottom level reference logically removes the node from the map. The thread which succeeds
+                    // in doing so must also move the value out.
+                    i_marked_it = node_to_remove.deref().nexts()[0].compare_and_set(node_next.with_tag(0), node_next.with_tag(1), Ordering::SeqCst, &guard).is_ok();
+                    node_next = node_to_remove.deref().nexts()[0].load(Ordering::SeqCst, &guard);
+                }
 
-            if i_marked_it {
-                // TODO optimize and try to CAS acc.preds instead.
-                self.find_pairs(key, &guard).is_ok();
+                if i_marked_it {
+                    // TODO optimize and try to CAS acc.preds instead.
+                    self.find_pairs(key, &guard).is_ok();
 
-                unsafe {
                     // This is fine since find_pairs is guaranteed to unlink (make unreachable) the node we search for.
-                    guard.unlinked(node_to_remove);
+                    let mut owned = node_to_remove.into_owned();
+                    let val = owned.val_opt_mut().take().unwrap();
 
-                    // We can just move the key and val out regardless of whether they're Copy or Clone,
-                    // since the memory will get freed but not dropped by the epoch GC.
-                    // TODO This was a bug. We need deferred destruction in the epoch collector.
-                    //ptr::drop_in_place(node_to_remove.key() as *const K as *mut K);
-                    Some(node_to_remove.val_cpy())
+                    guard.defer(move || drop(owned));
+
+                    Some(val)
+                } else {
+                    None
                 }
-            }
-            else {
-                None
-            }
-        } )
+            } )
+        }
     }
 
     /// If a node with the given key exists, returns a shared pointer to it in `Some`.
@@ -411,23 +429,25 @@ impl<K, V, S> EpochSkiplistMap<K, V, S>
     {
         let hash = self.hash(key);
 
-        let mut pred: Shared<Node<K, V>> = self.head.load(Ordering::SeqCst, g).unwrap();
-        for lvl in (0...TOP_LEVEL).rev() {
-            let mut curr: Shared<Node<K, V>> = pred.nexts()[lvl].load(Ordering::SeqCst, g).0.unwrap();
-            while curr.is_data() {
-                let curr_next: (Option<Shared<Node<K, V>>>, bool) = curr.nexts()[lvl].load(Ordering::SeqCst, g);
+        unsafe {
+            let mut pred: Shared<Node<K, V>> = self.head.load(Ordering::SeqCst, g);
+            for lvl in (0..=TOP_LEVEL).rev() {
+                let mut curr: Shared<Node<K, V>> = pred.deref().nexts()[lvl].load(Ordering::SeqCst, g);
+                while curr.deref().is_data() {
+                    let curr_next: Shared<Node<K, V>> = curr.deref().nexts()[lvl].load(Ordering::SeqCst, g);
 
-                if !curr_next.1 && curr.hash() == hash && curr.key().borrow() == key {
-                    return Some(curr);
-                }
-                else if curr.hash() > hash {
-                    break;
-                }
+                    if curr_next.tag() != 1 && curr.deref().hash() == hash && curr.deref().key().borrow() == key {
+                        return Some(curr);
+                    } else if curr.deref().hash() > hash {
+                        break;
+                    }
 
-                pred = curr;
-                curr = curr_next.0.unwrap();
+                    pred = curr;
+                    curr = curr_next;
+                }
             }
         }
+
         None
     }
 
@@ -449,22 +469,28 @@ impl<K, V, S> EpochSkiplistMap<K, V, S>
     {
         let guard = pin();
         self.find_no_cleanup(key, &guard).and_then(|node| {
-            Some(node.val().clone())
+            unsafe {
+                Some(node.deref().val().clone())
+            }
         } )
     }
 
     /// Returns the size of the map, that is the amount of key-value pairs in it.
     pub fn size(&self) -> usize {
         let guard = pin();
-        let mut curr: Shared<Node<K, V>> = self.head.load(Ordering::SeqCst, &guard).unwrap().nexts()[0].load(Ordering::SeqCst, &guard).0.unwrap();
         let mut count = 0;
-        while curr.is_data() {
-            let pr = curr.nexts()[0].load(Ordering::SeqCst, &guard);
-            if !pr.1 {
-                count += 1;
+
+        unsafe {
+            let mut curr: Shared<Node<K, V>> = self.head.load(Ordering::SeqCst, &guard).deref().nexts()[0].load(Ordering::SeqCst, &guard);
+            while curr.deref().is_data() {
+                let pr = curr.deref().nexts()[0].load(Ordering::SeqCst, &guard);
+                if pr.tag() != 1 {
+                    count += 1;
+                }
+                curr = pr;
             }
-            curr = pr.0.unwrap();
         }
+
         count
     }
 
@@ -481,7 +507,7 @@ mod tests {
 
     use std::sync::Barrier;
 
-    use crossbeam;
+    use crossbeam_utils::scoped::scope;
 
     use super::*;
 
@@ -567,7 +593,7 @@ mod tests {
     fn mt_n_insert_k(n_threads: usize, k_loops: usize) {
         let map: EpochSkiplistMap<u32, u32, _> = with_def_hasher();
         let b = Barrier::new(n_threads);
-        crossbeam::scope(|scope| {
+        scope(|scope| {
             for i in 0..n_threads {
                 let i = U32(i as u32);
                 scope.spawn(|| {
@@ -594,7 +620,7 @@ mod tests {
     fn mt_n_remove_k(n_threads: usize, k_loops: usize) {
         let map: EpochSkiplistMap<u32, u32, _> = with_def_hasher();
         let b = Barrier::new(n_threads);
-        crossbeam::scope(|scope| {
+        scope(|scope| {
             for i in 0..n_threads {
                 let i = U32(i as u32);
                 scope.spawn(|| {
